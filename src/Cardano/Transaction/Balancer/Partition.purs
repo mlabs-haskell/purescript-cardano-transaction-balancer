@@ -1,4 +1,4 @@
-module Ctl.Internal.Partition
+module Cardano.Transaction.Balancer.Partition
   ( class Equipartition
   , class Partition
   , equipartition

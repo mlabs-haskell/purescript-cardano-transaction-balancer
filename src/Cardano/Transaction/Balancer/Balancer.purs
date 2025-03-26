@@ -106,7 +106,7 @@ import Cardano.Transaction.Balancer.Types
 import Cardano.Transaction.Balancer.Types.Val (Val(Val), pprintVal)
 import Cardano.Transaction.Balancer.Types.Val as Val
 import Cardano.Transaction.Balancer.UtxoMinAda (utxoMinAdaValue)
-import Ctl.Internal.Partition
+import Cardano.Transaction.Balancer.Partition
   ( equipartition
   , equipartitionValueWithTokenQuantityUpperBound
   , partition
