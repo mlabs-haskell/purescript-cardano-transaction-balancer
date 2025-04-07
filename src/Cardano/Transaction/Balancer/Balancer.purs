@@ -1,7 +1,8 @@
 module Cardano.Transaction.Balancer
   ( getCertsBalance
   , getProposalsBalance
-  , runBalancer
+  , BalancerParams
+  , runDefaultBalancer
   , setTransactionCollateral
   ) where
 
@@ -208,6 +209,8 @@ type BalancerParams =
   , allUtxos :: UtxoMap
   , utxos :: UtxoMap
   , miscFee :: BigInt -- can be negative (deregistration)
+  , isCip30WalletAff :: Aff Boolean
+  , getWalletCollateralAff :: Aff (Maybe (Array TransactionUnspentOutput))
   }
 
 -- TODO: remove the parameter
@@ -230,12 +233,10 @@ data BalancerStep
   = PrebalanceTx (BalancerState Transaction)
   | BalanceChangeAndMinFee (BalancerState Transaction)
 
-runBalancer
-  :: Aff Boolean
-  -> Aff (Maybe (Array TransactionUnspentOutput))
-  -> BalancerParams
+runDefaultBalancer
+  :: BalancerParams
   -> BalanceTxM Transaction
-runBalancer isCip30WalletAff getWalletCollateralAff p = do
+runDefaultBalancer p = do
   utxos <- partitionAndFilterUtxos
   transaction <- addLovelacesToTransactionOutputs p.transaction
   mainLoop (initBalancerState transaction utxos.spendable)
@@ -256,12 +257,12 @@ runBalancer isCip30WalletAff getWalletCollateralAff p = do
   partitionAndFilterUtxos
     :: BalanceTxM { spendable :: UtxoMap, invalidInContext :: UtxoMap }
   partitionAndFilterUtxos = do
-    isCip30 <- liftAff isCip30WalletAff
+    isCip30 <- liftAff p.isCip30WalletAff
     -- Get collateral inputs to mark them as unspendable.
     -- Some CIP-30 wallets don't allow to sign Txs that spend it.
     nonSpendableCollateralInputs <-
       if isCip30 then
-        liftAff $ getWalletCollateralAff <#>
+        liftAff $ p.getWalletCollateralAff <#>
           fold >>> map (unwrap >>> _.input) >>> Set.fromFoldable
       else mempty
     asksConstraints Constraints._nonSpendableInputs <#>
