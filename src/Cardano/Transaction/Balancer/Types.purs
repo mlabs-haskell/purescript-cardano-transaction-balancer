@@ -1,5 +1,6 @@
 module Cardano.Transaction.Balancer.Types
   ( BalanceTxM
+  , CustomLogger
   , Logging
   , log
   , logWithLevel
@@ -28,7 +29,7 @@ type CustomLogger = Maybe (LogLevel -> Message -> Aff Unit)
 
 type Logging =
   { logLevel :: LogLevel
-  , customLogger :: Maybe (LogLevel -> Message -> Aff Unit)
+  , customLogger :: CustomLogger
   }
 
 type BalanceTxM (a :: Type) = ExceptT BalanceTxError (ReaderT Logging Aff) a

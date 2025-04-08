@@ -2,6 +2,7 @@ module Cardano.Transaction.Balancer
   ( getCertsBalance
   , getProposalsBalance
   , runBalancer
+  , runBalancerAff
   ) where
 
 import Prelude
@@ -37,7 +38,7 @@ import Cardano.Transaction.Balancer.Partition
   , equipartitionValueWithTokenQuantityUpperBound
   , partition
   )
-import Cardano.Transaction.Balancer.Types (BalanceTxM, logWithLevelAndTags)
+import Cardano.Transaction.Balancer.Types (BalanceTxM, CustomLogger, logWithLevelAndTags)
 import Cardano.Transaction.Balancer.Types.Val (Val(Val), pprintVal)
 import Cardano.Transaction.Balancer.Types.Val as Val
 import Cardano.Transaction.Balancer.UtxoMinAda (utxoMinAdaValue)
@@ -82,8 +83,9 @@ import Cardano.Types.TransactionBody (_votingProposals)
 import Cardano.Types.TransactionInput (TransactionInput)
 import Cardano.Types.Value (getMultiAsset, mkValue, pprintValue)
 import Cardano.Types.Value as Value
-import Control.Monad.Except (class MonadError, ExceptT(ExceptT))
+import Control.Monad.Except (class MonadError, ExceptT(ExceptT), runExceptT)
 import Control.Monad.Except.Trans (except)
+import Control.Monad.Reader (runReaderT)
 import Control.Parallel (parTraverse)
 import Data.Array as Array
 import Data.Array.NonEmpty (NonEmptyArray)
@@ -155,6 +157,17 @@ initBalancerState utxos transaction =
 data BalancerStep
   = PrebalanceTx BalancerState
   | BalanceChangeAndMinFee BalancerState
+
+runBalancerAff
+  :: LogLevel
+  -> CustomLogger
+  -> Transaction
+  -> BalancerContext
+  -> Aff (Either BalanceTxError Transaction)
+runBalancerAff logLevel customLogger unbalancedTx =
+  flip runReaderT { logLevel, customLogger }
+    <<< runExceptT
+    <<< runBalancer unbalancedTx
 
 runBalancer :: Transaction -> BalancerContext -> BalanceTxM Transaction
 runBalancer unbalancedTx ctx = do
