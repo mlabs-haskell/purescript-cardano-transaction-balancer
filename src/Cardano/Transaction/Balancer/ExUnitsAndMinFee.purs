@@ -7,17 +7,32 @@ import Prelude
 
 import Cardano.AsCbor (encodeCbor)
 import Cardano.Kupmios.Ogmios.Types (AdditionalUtxoSet) as Ogmios
+import Cardano.Provider (Provider)
 import Cardano.Provider.TxEvaluation
   ( TxEvaluationFailure(AdditionalUtxoOverlap, UnparsedError)
   , TxEvaluationResult(TxEvaluationResult)
   )
+import Cardano.Transaction.Balancer.Error
+  ( BalanceTxError(UtxoLookupFailedFor, ExUnitsEvaluationFailed, CouldNotComputeRefScriptsFee)
+  )
+import Cardano.Transaction.Balancer.Helpers
+  ( liftEither
+  , setScriptDataHash
+  , transactionInputToTxOutRef
+  , transactionOutputToOgmiosTxOut
+  , unsafeFromJust
+  )
+import Cardano.Transaction.Balancer.MinFee (calculateMinFee) as Contract.MinFee
+import Cardano.Transaction.Balancer.Types (BalanceTxM)
 import Cardano.Types
-  ( Coin
+  ( Address
+  , Coin
   , CostModel
   , ExUnits(ExUnits)
   , Language
   , PlutusData
   , PlutusScript
+  , ProtocolParameters
   , Redeemer(Redeemer)
   , Transaction
   , TransactionBody(TransactionBody)
@@ -36,28 +51,6 @@ import Cardano.Types.TransactionInput (TransactionInput)
 import Cardano.Types.TransactionWitnessSet (_redeemers)
 import Control.Monad.Error.Class (throwError)
 import Control.Monad.Except.Trans (except)
-import Control.Monad.Reader.Trans (asks)
-import Cardano.Transaction.Balancer.Constraints (_additionalUtxos, _collateralUtxos) as Constraints
-import Cardano.Transaction.Balancer.Error
-  ( BalanceTxError
-      ( UtxoLookupFailedFor
-      , ExUnitsEvaluationFailed
-      , CouldNotComputeRefScriptsFee
-      )
-  )
-import Cardano.Transaction.Balancer.Helpers
-  ( liftEither
-  , setScriptDataHash
-  , transactionInputToTxOutRef
-  , transactionOutputToOgmiosTxOut
-  , unsafeFromJust
-  )
-import Cardano.Transaction.Balancer.MinFee (calculateMinFee) as Contract.MinFee
-import Cardano.Transaction.Balancer.Types
-  ( BalanceTxM
-  , askCostModelsForLanguages
-  , asksConstraints
-  )
 import Data.Array (catMaybes)
 import Data.Array (fromFoldable, notElem) as Array
 import Data.Bifunctor (bimap, lmap)
@@ -68,7 +61,7 @@ import Data.Lens ((.~))
 import Data.Lens.Getter ((^.))
 import Data.Map (Map)
 import Data.Map (empty, filterKeys, fromFoldable, lookup, toUnfoldable, union) as Map
-import Data.Maybe (Maybe(Just, Nothing), fromMaybe, maybe)
+import Data.Maybe (Maybe(Just, Nothing), maybe)
 import Data.Newtype (unwrap, wrap)
 import Data.Set (Set)
 import Data.Set as Set
@@ -81,11 +74,11 @@ import Effect.Aff.Class (liftAff)
 import Effect.Class (liftEffect)
 
 evalTxExecutionUnits
-  :: Transaction
+  :: Provider
+  -> Transaction
+  -> UtxoMap
   -> BalanceTxM TxEvaluationResult
-evalTxExecutionUnits tx = do
-  additionalUtxos <- asksConstraints Constraints._additionalUtxos
-  worker $ toOgmiosAdditionalUtxos additionalUtxos
+evalTxExecutionUnits provider tx = worker <<< toOgmiosAdditionalUtxos
   where
   toOgmiosAdditionalUtxos :: UtxoMap -> Ogmios.AdditionalUtxoSet
   toOgmiosAdditionalUtxos additionalUtxos =
@@ -96,7 +89,6 @@ evalTxExecutionUnits tx = do
 
   worker :: Ogmios.AdditionalUtxoSet -> BalanceTxM TxEvaluationResult
   worker additionalUtxos = do
-    provider <- asks _.provider
     evalResult' <-
       map unwrap <$>
         (liftAff $ attempt $ provider.evaluateTx tx (unwrap additionalUtxos))
@@ -121,12 +113,18 @@ evalTxExecutionUnits tx = do
 -- and the minimum fee, including the script fees.
 -- Returns a tuple consisting of updated `UnbalancedTx` and the minimum fee.
 evalExUnitsAndMinFee
-  :: Transaction
-  -> UtxoMap
+  :: Provider
+  -> ProtocolParameters
+  -> Transaction
+  -> Array Address
+  -> { allUtxos :: UtxoMap
+     , collateralUtxos :: UtxoMap
+     , additionalUtxos :: UtxoMap
+     }
   -> BalanceTxM (Transaction /\ Coin)
-evalExUnitsAndMinFee transaction allUtxos = do
+evalExUnitsAndMinFee provider pparams transaction ownAddresses utxos = do
   -- Evaluate transaction ex units:
-  exUnits <- evalTxExecutionUnits transaction
+  exUnits <- evalTxExecutionUnits provider transaction utxos.additionalUtxos
   -- Set execution units received from the server:
   txWithExUnits <-
     case updateTxExecutionUnits transaction exUnits of
@@ -136,21 +134,15 @@ evalExUnitsAndMinFee transaction allUtxos = do
       _ -> throwError $ ExUnitsEvaluationFailed transaction
         (UnparsedError "Unable to extract ExUnits from Ogmios response")
   -- Attach datums and redeemers, set the script integrity hash:
-  finalizedTx <- finalizeTransaction txWithExUnits allUtxos
+  finalizedTx <- finalizeTransaction txWithExUnits utxos.allUtxos pparams
   -- Calculate the minimum fee for a transaction:
-  additionalUtxos <- asksConstraints Constraints._additionalUtxos
-  collateralUtxos <- fromMaybe Map.empty
-    <$> asksConstraints Constraints._collateralUtxos
   refScriptsTotalSize <- liftEither $ lmap CouldNotComputeRefScriptsFee $
-    calculateRefScriptsTotalSize finalizedTx allUtxos
+    calculateRefScriptsTotalSize finalizedTx utxos.allUtxos
 
-  ownAddrs <- asks _.ownAddresses
-  provider <- asks _.provider
-  protocolParameters <- asks _.protocolParameters
   minFee <- liftAff $ Contract.MinFee.calculateMinFee
-    { ownAddrs, provider, protocolParameters }
+    { ownAddrs: ownAddresses, provider, protocolParameters: pparams }
     finalizedTx
-    (Map.union additionalUtxos collateralUtxos)
+    (Map.union utxos.additionalUtxos utxos.collateralUtxos)
     (UInt.fromInt refScriptsTotalSize)
   pure $ txWithExUnits /\ minFee
 
@@ -170,9 +162,8 @@ calculateRefScriptsTotalSize tx utxoMap = do
 
 -- | Attaches datums and redeemers, sets the script integrity hash,
 -- | for use after reindexing.
-finalizeTransaction
-  :: Transaction -> UtxoMap -> BalanceTxM Transaction
-finalizeTransaction tx utxos = do
+finalizeTransaction :: Transaction -> UtxoMap -> ProtocolParameters -> BalanceTxM Transaction
+finalizeTransaction tx utxos pparams = do
   let
     txBody :: TransactionBody
     txBody = tx ^. _body
@@ -195,7 +186,10 @@ finalizeTransaction tx utxos = do
     languages :: Set Language
     languages = foldMap (Set.singleton <<< snd <<< unwrap) scripts
 
-  (costModels :: Map Language CostModel) <- askCostModelsForLanguages languages
+    costModels :: Map Language CostModel
+    costModels =
+      Map.filterKeys (flip Set.member languages) $
+        (unwrap pparams).costModels
 
   liftEffect $ setScriptDataHash costModels redeemers datums tx
   where

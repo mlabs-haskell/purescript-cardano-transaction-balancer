@@ -2,14 +2,49 @@ module Cardano.Transaction.Balancer
   ( getCertsBalance
   , getProposalsBalance
   , runBalancer
-  , setTransactionCollateral
   ) where
 
 import Prelude
 
+import Cardano.Provider (Provider)
+import Cardano.Transaction.Balancer.CoinSelection
+  ( SelectionState
+  , SelectionStrategy
+  , _leftoverUtxos
+  , performMultiAssetSelection
+  , selectedInputs
+  )
+import Cardano.Transaction.Balancer.CoinSelection.UtxoIndex (UtxoIndex, buildUtxoIndex)
+import Cardano.Transaction.Balancer.Collateral (setTransactionCollateral)
+import Cardano.Transaction.Balancer.Constraints
+  ( BalancerConfig
+  , _additionalUtxos
+  , _changeDatum
+  , _collateralUtxos
+  , _maxChangeOutputTokenQuantity
+  , _nonSpendableInputs
+  )
+import Cardano.Transaction.Balancer.Error
+  ( BalanceTxError(CouldNotGetUtxos, NumericOverflowError, UtxoLookupFailedFor)
+  )
+import Cardano.Transaction.Balancer.ExUnitsAndMinFee
+  ( evalExUnitsAndMinFee
+  , finalizeTransaction
+  )
+import Cardano.Transaction.Balancer.Helpers (liftEither, unsafeFromJust, (??))
+import Cardano.Transaction.Balancer.Partition
+  ( equipartition
+  , equipartitionValueWithTokenQuantityUpperBound
+  , partition
+  )
+import Cardano.Transaction.Balancer.Types (BalanceTxM, logWithLevelAndTags)
+import Cardano.Transaction.Balancer.Types.Val (Val(Val), pprintVal)
+import Cardano.Transaction.Balancer.Types.Val as Val
+import Cardano.Transaction.Balancer.UtxoMinAda (utxoMinAdaValue)
 import Cardano.Transaction.Edit (editTransaction)
 import Cardano.Types
-  ( AssetClass(AssetClass)
+  ( Address
+  , AssetClass(AssetClass)
   , Certificate
       ( UnregDrepCert
       , RegDrepCert
@@ -21,7 +56,9 @@ import Cardano.Types
       )
   , Coin(Coin)
   , Language(PlutusV1)
+  , NetworkId
   , PlutusScript(PlutusScript)
+  , ProtocolParameters(ProtocolParameters)
   , Transaction
   , TransactionBody
   , TransactionOutput
@@ -34,83 +71,20 @@ import Cardano.Types
   , _fee
   , _inputs
   , _mint
+  , _networkId
   , _outputs
-  , _plutusScripts
-  , _referenceInputs
   , _withdrawals
-  , _witnessSet
   )
-import Cardano.Types.Address (Address)
 import Cardano.Types.BigNum as BigNum
 import Cardano.Types.Coin as Coin
 import Cardano.Types.OutputDatum (OutputDatum(OutputDatum))
-import Cardano.Types.ProtocolParameters (ProtocolParameters(ProtocolParameters))
 import Cardano.Types.TransactionBody (_votingProposals)
 import Cardano.Types.TransactionInput (TransactionInput)
-import Cardano.Types.TransactionUnspentOutput as TransactionUnspentOutputs
-import Cardano.Types.UtxoMap (pprintUtxoMap)
 import Cardano.Types.Value (getMultiAsset, mkValue, pprintValue)
 import Cardano.Types.Value as Value
-import Control.Monad.Except (class MonadError)
-import Control.Monad.Except.Trans (ExceptT(ExceptT), except)
-import Control.Monad.Reader.Class (asks)
-import Cardano.Transaction.Balancer.CoinSelection
-  ( SelectionState
-  , SelectionStrategy
-  , _leftoverUtxos
-  , performMultiAssetSelection
-  , selectedInputs
-  )
-import Cardano.Transaction.Balancer.CoinSelection.UtxoIndex
-  ( UtxoIndex
-  , buildUtxoIndex
-  )
-import Cardano.Transaction.Balancer.Collateral
-  ( addTxCollateral
-  , addTxCollateralReturn
-  )
-import Cardano.Transaction.Balancer.Collateral.Select (selectCollateral)
-import Cardano.Transaction.Balancer.Constraints
-  ( _collateralUtxos
-  , _nonSpendableInputs
-  )
-import Cardano.Transaction.Balancer.Constraints
-  ( _maxChangeOutputTokenQuantity
-  , _nonSpendableInputs
-  ) as Constraints
-import Cardano.Transaction.Balancer.Error
-  ( BalanceTxError
-      ( NumericOverflowError
-      , UtxoLookupFailedFor
-      , InsufficientCollateralUtxos
-      , CouldNotGetCollateral
-      )
-  )
-import Cardano.Transaction.Balancer.ExUnitsAndMinFee
-  ( evalExUnitsAndMinFee
-  , finalizeTransaction
-  )
-import Cardano.Transaction.Balancer.Helpers
-  ( liftEither
-  , pprintTagSet
-  , unsafeFromJust
-  , (??)
-  )
-import Cardano.Transaction.Balancer.Types
-  ( BalanceTxM
-  , askCoinsPerUtxoUnit
-  , asksConstraints
-  , logWithLevel
-  , logWithLevelAndTags
-  )
-import Cardano.Transaction.Balancer.Types.Val (Val(Val), pprintVal)
-import Cardano.Transaction.Balancer.Types.Val as Val
-import Cardano.Transaction.Balancer.UtxoMinAda (utxoMinAdaValue)
-import Cardano.Transaction.Balancer.Partition
-  ( equipartition
-  , equipartitionValueWithTokenQuantityUpperBound
-  , partition
-  )
+import Control.Monad.Except (class MonadError, ExceptT(ExceptT))
+import Control.Monad.Except.Trans (except)
+import Control.Parallel (parTraverse)
 import Data.Array as Array
 import Data.Array.NonEmpty (NonEmptyArray)
 import Data.Array.NonEmpty
@@ -125,200 +99,190 @@ import Data.Array.NonEmpty
   ) as NEArray
 import Data.Array.NonEmpty as NEA
 import Data.Bitraversable (ltraverse)
-import Data.Either (Either, note)
+import Data.Either (Either, hush, note)
 import Data.Foldable (fold, foldMap, foldr, length, null, sum)
 import Data.Lens.Getter (view, (^.))
-import Data.Lens.Setter ((%~), (.~))
-import Data.Log.Level (LogLevel(Info, Warn))
+import Data.Lens.Setter ((%~), (.~), (?~))
+import Data.Log.Level (LogLevel(Info))
 import Data.Log.Tag (TagSet, tag, tagSetTag)
 import Data.Log.Tag (fromArray) as TagSet
-import Data.Map
-  ( empty
-  , filter
-  , insert
-  , isEmpty
-  , lookup
-  , singleton
-  , toUnfoldable
-  ) as Map
-import Data.Maybe (Maybe(Just, Nothing), isJust, maybe)
+import Data.Map (empty, filter, insert, isEmpty, lookup, singleton, toUnfoldable, union) as Map
+import Data.Maybe (Maybe(Just, Nothing), fromMaybe, isJust, maybe)
 import Data.Newtype (unwrap, wrap)
 import Data.Set (Set)
 import Data.Set (fromFoldable, member, toUnfoldable) as Set
 import Data.Traversable (for, traverse)
 import Data.Tuple (fst)
 import Data.Tuple.Nested (type (/\), (/\))
-import Data.UInt (toInt) as UInt
 import Effect.Aff (Aff)
 import Effect.Aff.Class (liftAff)
 import JS.BigInt (BigInt)
 import Partial.Unsafe (unsafePartial)
 
-setTransactionCollateral
-  :: Aff (Maybe (Array TransactionUnspentOutput))
-  -> Address
-  -> Transaction
-  -> BalanceTxM Transaction
-setTransactionCollateral getWalletCollateralAff changeAddr transaction = do
-  nonSpendableSet <- asksConstraints _nonSpendableInputs
-  mbCollateralUtxos <- asksConstraints _collateralUtxos
-  -- We must filter out UTxOs that are set as non-spendable in the balancer
-  -- constraints
-  let isSpendable = not <<< flip Set.member nonSpendableSet
-  collateral <- case mbCollateralUtxos of
-    -- if no collateral utxos are specified, use the wallet, but filter
-    -- the unspendable ones
-    Nothing -> do
-      let isSpendableUtxo = isSpendable <<< _.input <<< unwrap
-      (walletCollateral :: Array TransactionUnspentOutput) <- ExceptT $ liftAff
-        $
-          note CouldNotGetCollateral <$>
-            getWalletCollateralAff
-      let
-        { yes: spendableUtxos, no: filteredUtxos } = Array.partition
-          isSpendableUtxo
-          walletCollateral
-      when (not $ Array.null filteredUtxos) do
-        logWithLevel Warn $ pprintTagSet
-          "Some of the collateral UTxOs returned by the wallet were marked as non-spendable and ignored"
-          (pprintUtxoMap (TransactionUnspentOutputs.toUtxoMap filteredUtxos))
-      pure spendableUtxos
-    -- otherwise, get all the utxos, filter out unspendable, and select
-    -- collateral using internal algo, that is also used in KeyWallet
-    Just utxoMap -> do
-      ProtocolParameters params <- asks _.protocolParameters
-      let
-        maxCollateralInputs = UInt.toInt $ params.maxCollateralInputs
-        mbCollateral =
-          Array.fromFoldable <$>
-            selectCollateral params.coinsPerUtxoByte maxCollateralInputs utxoMap
-      liftEither $ note (InsufficientCollateralUtxos utxoMap) mbCollateral
-  addTxCollateralReturn collateral (addTxCollateral collateral transaction)
-    changeAddr
-
---------------------------------------------------------------------------------
--- Balancing Algorithm
---------------------------------------------------------------------------------
-
-type BalancerParams =
-  { strategy :: SelectionStrategy
-  , transaction :: Transaction
-  , changeAddress :: Address
-  , changeDatum :: Maybe OutputDatum
-  , allUtxos :: UtxoMap
-  , utxos :: UtxoMap
-  , miscFee :: BigInt -- can be negative (deregistration)
+type BalancerContext =
+  { balancerConstraints :: BalancerConfig
+  , provider :: Provider
+  , pparams :: ProtocolParameters
+  , network :: NetworkId
+  , walletInterface :: BalancerWalletInterface
+  , extraUtxos :: UtxoMap
   }
 
--- TODO: remove the parameter
-type BalancerState tx =
-  { transaction :: tx
+type BalancerWalletInterface =
+  { isCip30Wallet :: Boolean
+  , ownAddresses :: Array Address
+  , getWalletUtxos :: Aff (Maybe UtxoMap)
+  , filterLockedUtxos :: UtxoMap -> Aff UtxoMap
+  , getChangeAddress :: Aff Address
+  , getWalletCollateral :: Aff (Maybe (Array TransactionUnspentOutput))
+  }
+
+type BalancerState =
+  { transaction :: Transaction
   , leftoverUtxos :: UtxoIndex
   , changeOutputs :: Array TransactionOutput
   , minFee :: Coin
   }
 
-initBalancerState
-  :: Transaction
-  -> UtxoMap
-  -> BalancerState Transaction
-initBalancerState transaction =
-  buildUtxoIndex >>>
-    { transaction, leftoverUtxos: _, changeOutputs: mempty, minFee: Coin.zero }
+initBalancerState :: UtxoMap -> Transaction -> BalancerState
+initBalancerState utxos transaction =
+  { transaction
+  , leftoverUtxos: buildUtxoIndex utxos
+  , changeOutputs: mempty
+  , minFee: Coin.zero
+  }
 
 data BalancerStep
-  = PrebalanceTx (BalancerState Transaction)
-  | BalanceChangeAndMinFee (BalancerState Transaction)
+  = PrebalanceTx BalancerState
+  | BalanceChangeAndMinFee BalancerState
 
-runBalancer
-  :: Aff Boolean
-  -> Aff (Maybe (Array TransactionUnspentOutput))
-  -> BalancerParams
-  -> BalanceTxM Transaction
-runBalancer isCip30WalletAff getWalletCollateralAff p = do
-  utxos <- partitionAndFilterUtxos
-  transaction <- addLovelacesToTransactionOutputs p.transaction
-  mainLoop (initBalancerState transaction utxos.spendable)
+runBalancer :: Transaction -> BalancerContext -> BalanceTxM Transaction
+runBalancer unbalancedTx ctx = do
+  changeAddress <-
+    maybe (liftAff ctx.walletInterface.getChangeAddress) pure
+      (unwrap ctx.balancerConstraints).changeAddress
+  let txWithNetwork = setTxNetwork ctx.network unbalancedTx
+  txWithCollateral <-
+    case (unwrap (unwrap txWithNetwork).witnessSet).redeemers of
+      -- Don't set collateral if tx doesn't contain phase-2 scripts:
+      [] -> pure txWithNetwork
+      _ -> setTransactionCollateral ctx.walletInterface.getWalletCollateral
+        ctx.balancerConstraints
+        ctx.pparams
+        changeAddress
+        txWithNetwork
+  nonSpendableCollateralInputs <-
+    liftAff
+      if ctx.walletInterface.isCip30Wallet then
+        ctx.walletInterface.getWalletCollateral <#>
+          fold >>> map (unwrap >>> _.input) >>> Set.fromFoldable
+      else mempty
+  allUtxos <- getAllUtxos
+  availableUtxos <- liftAff $ ctx.walletInterface.filterLockedUtxos allUtxos
+  let
+    txWithMinAda = addLovelacesToTransactionOutputs ctx.pparams txWithCollateral
+    spendableUtxos = getSpendableUtxos availableUtxos nonSpendableCollateralInputs
+  mainLoop allUtxos changeAddress $ initBalancerState spendableUtxos txWithMinAda
   where
-  referenceInputSet = Set.fromFoldable $ p.transaction ^. _body
-    <<< _referenceInputs
+  getAllUtxos :: BalanceTxM UtxoMap
+  getAllUtxos = do
+    utxos <- ExceptT case (unwrap ctx.balancerConstraints).srcAddresses of
+      -- Use wallet utxos.
+      Nothing ->
+        note CouldNotGetUtxos <$> liftAff ctx.walletInterface.getWalletUtxos
+      -- Use utxos from the specified source addresses.
+      Just srcAddresses -> do
+        -- Even though some of the addresses may be controlled by the wallet,
+        -- we can't query the wallet for available UTxOs, because there's no
+        -- way to tell it to return UTxOs only from specific subset of the
+        -- addresses controlled by a CIP-30 wallet.
+        -- `utxosAt` calls are expensive when there are a lot of addresses to
+        -- check.
+        parTraverse (ctx.provider.utxosAt >>> liftAff >>> map hush) srcAddresses
+          <#> traverse (note CouldNotGetUtxos)
+            >>> map (foldr Map.union Map.empty) -- merge all utxos into one map
+    pure $ utxos `Map.union` ctx.extraUtxos
+
+  coinSelectionStrategy :: SelectionStrategy
+  coinSelectionStrategy = (unwrap ctx.balancerConstraints).selectionStrategy
+
+  referenceInputSet :: Set TransactionInput
+  referenceInputSet = Set.fromFoldable $ (unwrap (unwrap unbalancedTx).body).referenceInputs
+
+  miscFee :: BigInt
+  miscFee = getCertsBalance unbalancedTx ctx.pparams + getProposalsBalance unbalancedTx
 
   -- We check if the transaction uses a plutusv1 script, so that we can filter
   -- out utxos which use plutusv2 features if so.
   txHasPlutusV1 :: Boolean
   txHasPlutusV1 =
-    case p.transaction ^. _witnessSet <<< _plutusScripts of
+    case (unwrap (unwrap unbalancedTx).witnessSet).plutusScripts of
       [] -> false
       scripts -> flip Array.any scripts case _ of
         PlutusScript (_ /\ PlutusV1) -> true
         _ -> false
 
-  partitionAndFilterUtxos
-    :: BalanceTxM { spendable :: UtxoMap, invalidInContext :: UtxoMap }
-  partitionAndFilterUtxos = do
-    isCip30 <- liftAff isCip30WalletAff
+  getSpendableUtxos :: UtxoMap -> Set TransactionInput -> UtxoMap
+  getSpendableUtxos availableUtxos nonSpendableCollateralInputs =
     -- Get collateral inputs to mark them as unspendable.
     -- Some CIP-30 wallets don't allow to sign Txs that spend it.
-    nonSpendableCollateralInputs <-
-      if isCip30 then
-        liftAff $ getWalletCollateralAff <#>
-          fold >>> map (unwrap >>> _.input) >>> Set.fromFoldable
-      else mempty
-    asksConstraints Constraints._nonSpendableInputs <#>
-      append nonSpendableCollateralInputs >>>
-        \nonSpendableInputs ->
-          foldr
-            ( \(oref /\ output) acc ->
-                let
-                  hasInlineDatum :: Boolean
-                  hasInlineDatum = case (unwrap output).datum of
-                    Just (OutputDatum _) -> true
-                    _ -> false
+    let
+      nonSpendableInputs =
+        (ctx.balancerConstraints ^. _nonSpendableInputs)
+          <> nonSpendableCollateralInputs
+    in
+      _.spendable $ foldr
+        ( \(oref /\ output) acc ->
+            let
+              hasInlineDatum :: Boolean
+              hasInlineDatum = case (unwrap output).datum of
+                Just (OutputDatum _) -> true
+                _ -> false
 
-                  hasScriptRef :: Boolean
-                  hasScriptRef = isJust (unwrap output).scriptRef
+              hasScriptRef :: Boolean
+              hasScriptRef = isJust (unwrap output).scriptRef
 
-                  spendable :: Boolean
-                  spendable = not $ Set.member oref nonSpendableInputs ||
-                    Set.member oref referenceInputSet
+              spendable :: Boolean
+              spendable = not $ Set.member oref nonSpendableInputs ||
+                Set.member oref referenceInputSet
 
-                  validInContext :: Boolean
-                  validInContext = not $ txHasPlutusV1 &&
-                    (hasInlineDatum || hasScriptRef)
-                in
-                  case spendable, validInContext of
-                    true, true -> acc
-                      { spendable = Map.insert oref output acc.spendable }
-                    true, false -> acc
-                      { invalidInContext = Map.insert oref output
-                          acc.invalidInContext
-                      }
-                    _, _ -> acc
-            )
-            { spendable: Map.empty
-            , invalidInContext: Map.empty
-            }
-            (Map.toUnfoldable p.utxos :: Array _)
+              validInContext :: Boolean
+              validInContext = not $ txHasPlutusV1 &&
+                (hasInlineDatum || hasScriptRef)
+            in
+              case spendable, validInContext of
+                true, true -> acc
+                  { spendable = Map.insert oref output acc.spendable }
+                true, false -> acc
+                  { invalidInContext = Map.insert oref output
+                      acc.invalidInContext
+                  }
+                _, _ -> acc
+        )
+        { spendable: Map.empty
+        , invalidInContext: Map.empty
+        }
+        (Map.toUnfoldable availableUtxos :: Array _)
 
-  mainLoop :: BalancerState Transaction -> BalanceTxM Transaction
-  mainLoop = worker <<< PrebalanceTx
+  mainLoop :: UtxoMap -> Address -> BalancerState -> BalanceTxM Transaction
+  mainLoop allUtxos changeAddress = worker <<< PrebalanceTx
     where
     worker :: BalancerStep -> BalanceTxM Transaction
     worker (PrebalanceTx state) = do
-      logBalancerState "Pre-balancing (Stage 1)" p.allUtxos state
+      logBalancerState "Pre-balancing (Stage 1)" allUtxos state
       prebalanceTx state >>= runNextBalancerStep
     worker (BalanceChangeAndMinFee state@{ transaction, minFee, leftoverUtxos }) =
       do
-        logBalancerState "Balancing change and fees (Stage 2)" p.allUtxos state
+        logBalancerState "Balancing change and fees (Stage 2)" allUtxos state
         { transaction: evaluatedTx, minFee: newMinFee } <- evaluateTx state
         case newMinFee <= minFee of
           true -> do
-            logTransaction "Balanced transaction (Done)" p.allUtxos
+            logTransaction "Balanced transaction (Done)" allUtxos
               evaluatedTx
             if Array.null $ evaluatedTx ^. _body <<< _inputs then
               do
                 selectionState <-
-                  performMultiAssetSelection p.strategy leftoverUtxos
+                  performMultiAssetSelection coinSelectionStrategy leftoverUtxos
                     (Val one Map.empty)
                 runNextBalancerStep $ state
                   { transaction = flip editTransaction transaction $
@@ -328,11 +292,10 @@ runBalancer isCip30WalletAff getWalletCollateralAff p = do
                       selectionState ^. _leftoverUtxos
                   }
             else do
-              finalizeTransaction evaluatedTx p.allUtxos
+              finalizeTransaction evaluatedTx allUtxos ctx.pparams
           false ->
             runNextBalancerStep $ state
-              { transaction = transaction
-                  # _body <<< _fee .~ newMinFee
+              { transaction = transaction # _body <<< _fee .~ newMinFee
               , minFee = newMinFee
               }
 
@@ -341,21 +304,23 @@ runBalancer isCip30WalletAff getWalletCollateralAff p = do
     -- | If the transaction remains unbalanced (i.e. `requiredValue != mempty`)
     -- | after generation of change, the first balancing step `PrebalanceTx`
     -- | is performed, otherwise we proceed to `BalanceChangeAndMinFee`.
-    runNextBalancerStep
-      :: BalancerState Transaction -> BalanceTxM Transaction
+    runNextBalancerStep :: BalancerState -> BalanceTxM Transaction
     runNextBalancerStep state@{ transaction } = do
       let txBody = transaction ^. _body
-      inputValue <- except $ getInputVal p.allUtxos txBody
-      ownWalletAddresses <- Set.fromFoldable <$> asks _.ownAddresses
+      inputValue <- except $ getInputVal allUtxos txBody
       inputValue' <- liftValue inputValue
-      changeOutputs <- makeChange ownWalletAddresses p.changeAddress
-        p.changeDatum
-        inputValue'
-        p.miscFee
-        txBody
+      let
+        ownWalletAddresses = Set.fromFoldable ctx.walletInterface.ownAddresses
+        coinsPerUtxoByte = (unwrap ctx.pparams).coinsPerUtxoByte
+      changeOutputs <-
+        makeChange ctx.balancerConstraints ownWalletAddresses changeAddress
+          inputValue'
+          miscFee
+          coinsPerUtxoByte
+          txBody
 
       requiredValue <-
-        except $ getRequiredValue p.miscFee p.allUtxos
+        except $ getRequiredValue miscFee allUtxos
           $ setTxChangeOutputs changeOutputs transaction ^. _body
 
       worker $
@@ -366,8 +331,7 @@ runBalancer isCip30WalletAff getWalletCollateralAff p = do
     -- | Selects a combination of unspent transaction outputs from the wallet's
     -- | utxo set so that the total input value is sufficient to cover all
     -- | transaction outputs, including generated change and min fee.
-    prebalanceTx
-      :: BalancerState Transaction -> BalanceTxM (BalancerState Transaction)
+    prebalanceTx :: BalancerState -> BalanceTxM BalancerState
     prebalanceTx state@{ transaction, changeOutputs, leftoverUtxos } =
       performCoinSelection <#> \selectionState -> state
         { transaction =
@@ -385,8 +349,8 @@ runBalancer isCip30WalletAff getWalletCollateralAff p = do
         let
           txBody :: TransactionBody
           txBody = setTxChangeOutputs changeOutputs transaction ^. _body
-        except (getRequiredValue p.miscFee p.allUtxos txBody)
-          >>= performMultiAssetSelection p.strategy leftoverUtxos
+        except (getRequiredValue miscFee allUtxos txBody)
+          >>= performMultiAssetSelection coinSelectionStrategy leftoverUtxos
 
     -- | Calculates execution units for each script in the transaction and sets
     -- | min fee.
@@ -394,34 +358,42 @@ runBalancer isCip30WalletAff getWalletCollateralAff p = do
     -- | The transaction must be pre-balanced before evaluating execution units,
     -- | since this pre-condition is sometimes required for successfull script
     -- | execution during transaction evaluation.
-    evaluateTx
-      :: BalancerState Transaction -> BalanceTxM (BalancerState Transaction)
+    evaluateTx :: BalancerState -> BalanceTxM BalancerState
     evaluateTx state@{ transaction, changeOutputs } = do
       let
         prebalancedTx :: Transaction
         prebalancedTx = setTxChangeOutputs changeOutputs transaction
-      evaluatedTx /\ minFee <- evalExUnitsAndMinFee
-        prebalancedTx
-        p.allUtxos
-      pure $ state { transaction = evaluatedTx, minFee = minFee }
+      evaluatedTx /\ minFee <- evalExUnitsAndMinFee ctx.provider ctx.pparams prebalancedTx
+        ctx.walletInterface.ownAddresses
+        { allUtxos: allUtxos
+        , collateralUtxos: fromMaybe Map.empty $ ctx.balancerConstraints ^. _collateralUtxos
+        , additionalUtxos: ctx.balancerConstraints ^. _additionalUtxos
+        }
+      pure $ state
+        { transaction = evaluatedTx
+        , minFee = minFee
+        }
+
+setTxNetwork :: NetworkId -> Transaction -> Transaction
+setTxNetwork network tx =
+  maybe (tx # _body <<< _networkId ?~ network) (const tx)
+    (unwrap (unwrap tx).body).networkId
 
 -- | For each transaction output, if necessary, adds some number of lovelaces
 -- | to cover the utxo min-ada-value requirement.
-addLovelacesToTransactionOutputs
-  :: Transaction -> BalanceTxM Transaction
-addLovelacesToTransactionOutputs transaction =
-  map
-    ( \txOutputs -> transaction #
-        _body <<< _outputs .~ txOutputs
-    ) $
-    traverse addLovelacesToTransactionOutput
-      (transaction ^. _body <<< _outputs)
+addLovelacesToTransactionOutputs :: ProtocolParameters -> Transaction -> Transaction
+addLovelacesToTransactionOutputs pparams transaction =
+  transaction # _body <<< _outputs .~
+    ( addLovelacesToTransactionOutput pparams <$>
+        (unwrap (unwrap transaction).body).outputs
+    )
 
-addLovelacesToTransactionOutput
-  :: TransactionOutput -> BalanceTxM TransactionOutput
-addLovelacesToTransactionOutput txOutput = do
-  coinsPerUtxoUnit <- askCoinsPerUtxoUnit
+addLovelacesToTransactionOutput :: ProtocolParameters -> TransactionOutput -> TransactionOutput
+addLovelacesToTransactionOutput pparams txOutput =
   let
+    coinsPerUtxoUnit :: Coin
+    coinsPerUtxoUnit = (unwrap pparams).coinsPerUtxoByte
+
     txOutputMinAda = Coin $ utxoMinAdaValue coinsPerUtxoUnit txOutput
     txOutputRec = unwrap txOutput
 
@@ -430,9 +402,10 @@ addLovelacesToTransactionOutput txOutput = do
 
     newCoin :: Coin
     newCoin = max (Value.getCoin txOutputValue) txOutputMinAda
-
-  pure $ wrap txOutputRec
-    { amount = mkValue newCoin (getMultiAsset txOutputValue) }
+  in
+    wrap txOutputRec
+      { amount = mkValue newCoin (getMultiAsset txOutputValue)
+      }
 
 -- removes duplicates
 appendInputs
@@ -467,19 +440,21 @@ setTxChangeOutputs outputs tx =
 -- | the number of desired outputs for change generation. See
 -- | https://github.com/Plutonomicon/cardano-transaction-lib/issues/1530
 makeChange
-  :: Set Address
+  :: BalancerConfig
+  -> Set Address
   -> Address
-  -> Maybe OutputDatum
   -> Value
   -> BigInt
+  -> Coin
   -> TransactionBody
   -> BalanceTxM (Array TransactionOutput)
 makeChange
+  balancerConstraints
   ownWalletAddresses
   changeAddress
-  changeDatum
   inputValue'
   miscFee
+  coinsPerUtxoByte
   txBody =
   -- Always generate change when a transaction has no outputs to avoid issues
   -- with transaction confirmation:
@@ -488,7 +463,8 @@ makeChange
   else do
     res <- traverse (ltraverse liftValue) changeValueOutputCoinPairs
       >>= splitOversizedValues
-      >>= assignCoinsToChangeValues changeAddress excessCoin
+        >>> map (assignCoinsToChangeValues coinsPerUtxoByte changeAddress excessCoin)
+    let changeDatum = balancerConstraints ^. _changeDatum
     pure $ mkChangeOutput changeAddress changeDatum <$> res
   where
   inputValue = Val.fromValue inputValue'
@@ -517,8 +493,8 @@ makeChange
   splitOversizedValues
     :: NonEmptyArray (Value /\ BigInt)
     -> BalanceTxM (NonEmptyArray (Value /\ BigInt))
-  splitOversizedValues pairs =
-    asksConstraints Constraints._maxChangeOutputTokenQuantity >>= case _ of
+  splitOversizedValues pairs = do
+    case balancerConstraints ^. _maxChangeOutputTokenQuantity of
       Nothing -> pure pairs
       Just maxTokenQuantity -> do
         traverse bundle pairs <#> \bundled ->
@@ -539,7 +515,7 @@ makeChange
 
   -- outputs belonging to one of the wallet's addresses.
   ownAddressOutputs :: Array TransactionOutput
-  ownAddressOutputs = Array.filter isOwnWalletAddress $ txBody ^. _outputs
+  ownAddressOutputs = Array.filter isOwnWalletAddress $ (unwrap txBody).outputs
     where
     isOwnWalletAddress = unwrap >>> _.address >>> flip Set.member
       ownWalletAddresses
@@ -645,15 +621,15 @@ makeChangeForCoin weights excess =
 -- | Taken from cardano-wallet:
 -- | https://github.com/input-output-hk/cardano-wallet/blob/4c2eb651d79212157a749d8e69a48fff30862e93/lib/wallet/src/Cardano/Wallet/CoinSelection/Internal/Balance.hs#L1631
 assignCoinsToChangeValues
-  :: Address
+  :: Coin
+  -> Address
   -> BigInt
   -> NonEmptyArray (Value /\ BigInt)
-  -> BalanceTxM (Array Value)
-assignCoinsToChangeValues changeAddress adaAvailable pairsAtStart =
-  changeValuesAtStart <#> \changeValues ->
-    unsafeFromJust "assignCoinsToChangeValues" <<< Val.toValue <$> worker
-      (adaRequiredAtStart changeValues)
-      changeValues
+  -> Array Value
+assignCoinsToChangeValues coinsPerUtxoByte changeAddress adaAvailable pairsAtStart =
+  unsafeFromJust "assignCoinsToChangeValues" <<< Val.toValue <$> worker
+    (adaRequiredAtStart changeValuesAtStart)
+    changeValuesAtStart
   where
   worker :: BigInt -> NonEmptyArray ChangeValue -> Array Val
   worker adaRequired changeValues = changeValues # NEArray.uncons >>> case _ of
@@ -690,18 +666,20 @@ assignCoinsToChangeValues changeAddress adaAvailable pairsAtStart =
   adaRequiredAtStart :: NonEmptyArray ChangeValue -> BigInt
   adaRequiredAtStart = sum <<< map _.minCoin
 
-  changeValuesAtStart :: BalanceTxM (NonEmptyArray ChangeValue)
+  changeValuesAtStart :: NonEmptyArray ChangeValue
   changeValuesAtStart =
-    for pairsAtStart \(value /\ outputAda) ->
-      { value: Val.fromValue value, outputAda, minCoin: _ } <$> minCoinFor value
+    pairsAtStart <#> \(value /\ outputAda) ->
+      { value: Val.fromValue value
+      , outputAda
+      , minCoin: minCoinFor value
+      }
 
-  minCoinFor :: Value -> BalanceTxM BigInt
-  minCoinFor value = do
-    let
+  minCoinFor :: Value -> BigInt
+  minCoinFor =
+    BigNum.toBigInt
+      <<< utxoMinAdaValue coinsPerUtxoByte
       -- NOTE: Datum here doesn't matter, we deconstruct UTxO immediately anyway
-      txOutput = mkChangeOutput changeAddress Nothing value
-    coinsPerUtxoByte <- askCoinsPerUtxoUnit
-    pure $ BigNum.toBigInt $ utxoMinAdaValue coinsPerUtxoByte txOutput
+      <<< mkChangeOutput changeAddress Nothing
 
 type ChangeValue = { value :: Val, outputAda :: BigInt, minCoin :: BigInt }
 
@@ -800,16 +778,11 @@ getCertsBalance tx (ProtocolParameters pparams) =
 -- Helpers
 --------------------------------------------------------------------------------
 
-logBalancerState
-  :: String
-  -> UtxoMap
-  -> BalancerState Transaction
-  -> BalanceTxM Unit
+logBalancerState :: String -> UtxoMap -> BalancerState -> BalanceTxM Unit
 logBalancerState message utxos { transaction, changeOutputs } =
   logTransactionWithChange message utxos (Just changeOutputs) transaction
 
-logTransaction
-  :: String -> UtxoMap -> Transaction -> BalanceTxM Unit
+logTransaction :: String -> UtxoMap -> Transaction -> BalanceTxM Unit
 logTransaction message utxos =
   logTransactionWithChange message utxos Nothing
 
