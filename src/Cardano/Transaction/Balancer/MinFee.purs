@@ -6,13 +6,10 @@ module Cardano.Transaction.Balancer.MinFee
 
 import Prelude
 
-import Cardano.Data.Lite
-  ( linearFee_new
-  , minFee
-  , minRefScriptFee
-  , minScriptFee
-  )
+import Cardano.Data.Lite (linearFee_new, minFee, minRefScriptFee, minScriptFee)
 import Cardano.Provider (Provider)
+import Cardano.Transaction.Balancer.Helpers (liftM, liftedM, unsafeFromJust)
+import Cardano.Transaction.Balancer.Types.ProtocolParameters (BalancerProtocolParameters)
 import Cardano.Types
   ( Certificate
       ( StakeRegistration
@@ -55,16 +52,8 @@ import Cardano.Types.Credential (asPubKeyHash) as Credential
 import Cardano.Types.Ed25519Signature as Ed25519Signature
 import Cardano.Types.ExUnitPrices as ExUnitPrices
 import Cardano.Types.NativeScript
-  ( NativeScript
-      ( ScriptPubkey
-      , ScriptAll
-      , ScriptAny
-      , ScriptNOfK
-      , TimelockStart
-      , TimelockExpiry
-      )
+  ( NativeScript(ScriptPubkey, ScriptAll, ScriptAny, ScriptNOfK, TimelockStart, TimelockExpiry)
   )
-import Cardano.Types.ProtocolParameters (ProtocolParameters(ProtocolParameters))
 import Cardano.Types.PublicKey as PublicKey
 import Cardano.Types.Rational as Rational
 import Cardano.Types.Transaction as Transaction
@@ -72,7 +61,6 @@ import Cardano.Types.TransactionBody (_votingProcedures)
 import Cardano.Types.TransactionInput (TransactionInput)
 import Cardano.Types.UnitInterval as UnitInterval
 import Control.Monad.Error.Class (class MonadThrow)
-import Cardano.Transaction.Balancer.Helpers (liftM, liftedM, unsafeFromJust)
 import Data.Array (fromFoldable, mapMaybe)
 import Data.Array (fromFoldable, nub, range, replicate) as Array
 import Data.ByteArray as BytesArray
@@ -111,15 +99,16 @@ import Effect.Class (class MonadEffect)
 import Effect.Exception (Error)
 import Partial.Unsafe (unsafePartial)
 
-type CalculateMinFeeData =
+type CalculateMinFeeData (r :: Row Type) =
   { ownAddrs :: Array Address
   , provider :: Provider
-  , protocolParameters :: ProtocolParameters
+  , protocolParameters :: Record (BalancerProtocolParameters r)
   }
 
 -- | Calculate the minimum transaction fee.
 calculateMinFee
-  :: CalculateMinFeeData
+  :: forall (r :: Row Type)
+   . CalculateMinFeeData r
   -> Transaction
   -> UtxoMap
   -> UInt
@@ -134,7 +123,8 @@ calculateMinFee mfData tx additionalUtxos refScriptsSize =
 -- | for signing to make the transaction valid for the network.
 
 getSelfSigners
-  :: CalculateMinFeeData
+  :: forall (r :: Row Type)
+   . CalculateMinFeeData r
   -> Transaction
   -> UtxoMap
   -> Aff (Set Ed25519KeyHash)
@@ -267,19 +257,15 @@ getSignersForVotingProcedures =
 -- | `min_fee` calculation using CDL.
 
 calculateMinFeeCdl
-  :: forall (m :: Type -> Type)
+  :: forall (m :: Type -> Type) (r :: Row Type)
    . MonadEffect m
   => MonadThrow Error m
-  => ProtocolParameters
+  => Record (BalancerProtocolParameters r)
   -> Set Ed25519KeyHash
   -> Transaction
   -> UInt
   -> m Coin
-calculateMinFeeCdl
-  (ProtocolParameters pparams)
-  selfSigners
-  txNoSigs
-  refScriptsSize = do
+calculateMinFeeCdl pparams selfSigners txNoSigs refScriptsSize = do
   let
     tx = addFakeSignatures selfSigners txNoSigs
     cslTx = Transaction.toCdl tx

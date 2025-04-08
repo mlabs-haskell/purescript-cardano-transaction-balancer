@@ -24,6 +24,7 @@ import Cardano.Transaction.Balancer.Helpers
   )
 import Cardano.Transaction.Balancer.MinFee (calculateMinFee) as Contract.MinFee
 import Cardano.Transaction.Balancer.Types (BalanceTxM)
+import Cardano.Transaction.Balancer.Types.ProtocolParameters (BalancerProtocolParameters)
 import Cardano.Types
   ( Address
   , Coin
@@ -32,7 +33,6 @@ import Cardano.Types
   , Language
   , PlutusData
   , PlutusScript
-  , ProtocolParameters
   , Redeemer(Redeemer)
   , Transaction
   , TransactionBody(TransactionBody)
@@ -113,8 +113,9 @@ evalTxExecutionUnits provider tx = worker <<< toOgmiosAdditionalUtxos
 -- and the minimum fee, including the script fees.
 -- Returns a tuple consisting of updated `UnbalancedTx` and the minimum fee.
 evalExUnitsAndMinFee
-  :: Provider
-  -> ProtocolParameters
+  :: forall (r :: Row Type)
+   . Provider
+  -> Record (BalancerProtocolParameters r)
   -> Transaction
   -> Array Address
   -> { allUtxos :: UtxoMap
@@ -162,7 +163,12 @@ calculateRefScriptsTotalSize tx utxoMap = do
 
 -- | Attaches datums and redeemers, sets the script integrity hash,
 -- | for use after reindexing.
-finalizeTransaction :: Transaction -> UtxoMap -> ProtocolParameters -> BalanceTxM Transaction
+finalizeTransaction
+  :: forall (r :: Row Type)
+   . Transaction
+  -> UtxoMap
+  -> Record (BalancerProtocolParameters r)
+  -> BalanceTxM Transaction
 finalizeTransaction tx utxos pparams = do
   let
     txBody :: TransactionBody
@@ -187,9 +193,7 @@ finalizeTransaction tx utxos pparams = do
     languages = foldMap (Set.singleton <<< snd <<< unwrap) scripts
 
     costModels :: Map Language CostModel
-    costModels =
-      Map.filterKeys (flip Set.member languages) $
-        (unwrap pparams).costModels
+    costModels = Map.filterKeys (flip Set.member languages) pparams.costModels
 
   liftEffect $ setScriptDataHash costModels redeemers datums tx
   where

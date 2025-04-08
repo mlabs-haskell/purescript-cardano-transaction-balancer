@@ -20,13 +20,13 @@ import Cardano.Transaction.Balancer.Error
   )
 import Cardano.Transaction.Balancer.Helpers (pprintTagSet)
 import Cardano.Transaction.Balancer.Types (BalanceTxM, logWithLevel)
+import Cardano.Transaction.Balancer.Types.ProtocolParameters (BalancerProtocolParameters)
 import Cardano.Transaction.Balancer.UtxoMinAda (utxoMinAdaValue)
 import Cardano.Types
   ( Address
   , BigNum
   , Coin
   , MultiAsset
-  , ProtocolParameters
   , Transaction
   , TransactionOutput
   , TransactionUnspentOutput
@@ -57,9 +57,10 @@ import Effect.Aff (Aff)
 import Effect.Aff.Class (liftAff)
 
 setTransactionCollateral
-  :: Aff (Maybe (Array TransactionUnspentOutput))
+  :: forall (r :: Row Type)
+   . Aff (Maybe (Array TransactionUnspentOutput))
   -> BalancerConfig
-  -> ProtocolParameters
+  -> Record (BalancerProtocolParameters r)
   -> Address
   -> Transaction
   -> BalanceTxM Transaction
@@ -76,7 +77,7 @@ setTransactionCollateral
   -- constraints
   let
     isSpendable = not <<< flip Set.member nonSpendableSet
-    coinsPerUtxoByte = (unwrap pparams).coinsPerUtxoByte
+    coinsPerUtxoByte = pparams.coinsPerUtxoByte
   collateral <- case mbCollateralUtxos of
     -- if no collateral utxos are specified, use the wallet, but filter
     -- the unspendable ones
@@ -99,7 +100,7 @@ setTransactionCollateral
     -- collateral using internal algo, that is also used in KeyWallet
     Just utxoMap -> do
       let
-        maxCollateralInputs = UInt.toInt $ (unwrap pparams).maxCollateralInputs
+        maxCollateralInputs = UInt.toInt pparams.maxCollateralInputs
         mbCollateral =
           Array.fromFoldable <$>
             selectCollateral coinsPerUtxoByte maxCollateralInputs utxoMap

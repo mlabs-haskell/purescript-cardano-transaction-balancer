@@ -39,6 +39,7 @@ import Cardano.Transaction.Balancer.Partition
   , partition
   )
 import Cardano.Transaction.Balancer.Types (BalanceTxM, CustomLogger, logWithLevelAndTags)
+import Cardano.Transaction.Balancer.Types.ProtocolParameters (BalancerProtocolParameters)
 import Cardano.Transaction.Balancer.Types.Val (Val(Val), pprintVal)
 import Cardano.Transaction.Balancer.Types.Val as Val
 import Cardano.Transaction.Balancer.UtxoMinAda (utxoMinAdaValue)
@@ -59,7 +60,6 @@ import Cardano.Types
   , Language(PlutusV1)
   , NetworkId
   , PlutusScript(PlutusScript)
-  , ProtocolParameters(ProtocolParameters)
   , Transaction
   , TransactionBody
   , TransactionOutput
@@ -121,10 +121,10 @@ import Effect.Aff.Class (liftAff)
 import JS.BigInt (BigInt)
 import Partial.Unsafe (unsafePartial)
 
-type BalancerContext =
+type BalancerContext (r :: Row Type) =
   { balancerConstraints :: BalancerConfig
   , provider :: Provider
-  , pparams :: ProtocolParameters
+  , pparams :: Record (BalancerProtocolParameters r)
   , network :: NetworkId
   , walletInterface :: BalancerWalletInterface
   , extraUtxos :: UtxoMap
@@ -159,17 +159,22 @@ data BalancerStep
   | BalanceChangeAndMinFee BalancerState
 
 runBalancerAff
-  :: LogLevel
+  :: forall (r :: Row Type)
+   . LogLevel
   -> CustomLogger
   -> Transaction
-  -> BalancerContext
+  -> BalancerContext r
   -> Aff (Either BalanceTxError Transaction)
 runBalancerAff logLevel customLogger unbalancedTx =
   flip runReaderT { logLevel, customLogger }
     <<< runExceptT
     <<< runBalancer unbalancedTx
 
-runBalancer :: Transaction -> BalancerContext -> BalanceTxM Transaction
+runBalancer
+  :: forall (r :: Row Type)
+   . Transaction
+  -> BalancerContext r
+  -> BalanceTxM Transaction
 runBalancer unbalancedTx ctx = do
   changeAddress <-
     maybe (liftAff ctx.walletInterface.getChangeAddress) pure
@@ -324,7 +329,7 @@ runBalancer unbalancedTx ctx = do
       inputValue' <- liftValue inputValue
       let
         ownWalletAddresses = Set.fromFoldable ctx.walletInterface.ownAddresses
-        coinsPerUtxoByte = (unwrap ctx.pparams).coinsPerUtxoByte
+        coinsPerUtxoByte = ctx.pparams.coinsPerUtxoByte
       changeOutputs <-
         makeChange ctx.balancerConstraints ownWalletAddresses changeAddress
           inputValue'
@@ -394,18 +399,26 @@ setTxNetwork network tx =
 
 -- | For each transaction output, if necessary, adds some number of lovelaces
 -- | to cover the utxo min-ada-value requirement.
-addLovelacesToTransactionOutputs :: ProtocolParameters -> Transaction -> Transaction
+addLovelacesToTransactionOutputs
+  :: forall (r :: Row Type)
+   . Record (BalancerProtocolParameters r)
+  -> Transaction
+  -> Transaction
 addLovelacesToTransactionOutputs pparams transaction =
   transaction # _body <<< _outputs .~
     ( addLovelacesToTransactionOutput pparams <$>
         (unwrap (unwrap transaction).body).outputs
     )
 
-addLovelacesToTransactionOutput :: ProtocolParameters -> TransactionOutput -> TransactionOutput
+addLovelacesToTransactionOutput
+  :: forall (r :: Row Type)
+   . Record (BalancerProtocolParameters r)
+  -> TransactionOutput
+  -> TransactionOutput
 addLovelacesToTransactionOutput pparams txOutput =
   let
     coinsPerUtxoUnit :: Coin
-    coinsPerUtxoUnit = (unwrap pparams).coinsPerUtxoByte
+    coinsPerUtxoUnit = pparams.coinsPerUtxoByte
 
     txOutputMinAda = Coin $ utxoMinAdaValue coinsPerUtxoUnit txOutput
     txOutputRec = unwrap txOutput
@@ -741,8 +754,12 @@ getProposalsBalance tx =
   in
     deposits
 
-getCertsBalance :: Transaction -> ProtocolParameters -> BigInt
-getCertsBalance tx (ProtocolParameters pparams) =
+getCertsBalance
+  :: forall (r :: Row Type)
+   . Transaction
+  -> Record (BalancerProtocolParameters r)
+  -> BigInt
+getCertsBalance tx pparams =
   let
     stakeAddressDeposit :: BigInt
     stakeAddressDeposit = BigNum.toBigInt $ unwrap pparams.stakeAddressDeposit
