@@ -1,12 +1,14 @@
-SHELL := bash
-.ONESHELL:
-.PHONY: check-format format build
-.SHELLFLAGS := -eu -o pipefail -c
+.PHONY: check-explicit-exports check-format format clean build
 
 ps-sources := $(shell fd --no-ignore-parent -epurs)
 nix-sources := $(shell fd --no-ignore-parent -enix --exclude='spago*')
-purs-args := "--stash --censor-lib --censor-codes=UserDefinedWarning,ImplicitImport,ImplicitQualifiedImport,ImplicitQualifiedImportReExport"
+purs-args := "--stash --censor-lib --censor-codes=ImplicitImport,ImplicitQualifiedImport,ImplicitQualifiedImportReExport,UserDefinedWarning"
 
+requires-nix-shell:
+	@[ "$(IN_NIX_SHELL)" ] || \
+		( echo "The '$(MAKECMDGOALS)' target must be run from inside a nix shell, run 'nix develop' first." \
+				&& false \
+		)
 
 .ONESHELL:
 check-explicit-exports:
@@ -18,14 +20,18 @@ check-explicit-exports:
 		echo "All imports/exports are explicit"
 	fi
 
-check-format: check-explicit-exports
+check-format: requires-nix-shell check-explicit-exports
 	@purs-tidy check ${ps-sources}
 	@nixpkgs-fmt --check ${nix-sources}
 
-format:
-	@purs-tidy format-in-place ${ps-sources}
+format: requires-nix-shell
+	@echo '1. Formatting PureScript sources:'
+	purs-tidy format-in-place ${ps-sources}
+	@echo -e '\n2. Formatting Nix sources:'
 	nixpkgs-fmt ${nix-sources}
-	make check-explicit-exports
+
+clean:
+	rm -r output
 
 build:
 	@spago build --purs-args ${purs-args}

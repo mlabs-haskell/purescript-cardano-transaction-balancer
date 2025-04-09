@@ -20,12 +20,7 @@
     };
   };
 
-  outputs =
-    inputs @ { self
-    , flake-parts
-    , hercules-ci-effects
-    , ...
-    }:
+  outputs = inputs @ { self, flake-parts, hercules-ci-effects, ... }:
     flake-parts.lib.mkFlake { inherit inputs; } ({ ... }: {
       imports = [
         # Hercules CI effects module used to deploy to GitHub Pages
@@ -35,16 +30,20 @@
       # Systems supported by this flake
       systems = [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ];
 
-      perSystem =
-        { self'
-        , pkgs
-        , system
-        , ...
-        }:
+      perSystem = { self', pkgs, system, ... }:
         let
           easy-ps = import inputs.easy-purescript-nix { inherit pkgs; };
 
           spagoPkgs = import ./spago-packages.nix { inherit pkgs; };
+
+          projectName = "purescript-cardano-transaction-balancer";
+          strictComp = true;
+          censorCodes = [
+            "ImplicitImport"
+            "ImplicitQualifiedImport"
+            "ImplicitQualifiedImportReExport"
+            "UserDefinedWarning"
+          ];
 
           # building/testing machinery is taken from cardano-transaction-lib.
           # TODO: migrate it to a separate repo
@@ -54,19 +53,17 @@
           # Intended to be used in `buildPursProject` to not recompile the entire
           # package set every time.
           buildPursDependencies =
-            {
+            { name
               # If warnings generated from project source files will trigger a build error.
               # Controls `--strict` purescript-psa flag
-              strictComp ? true
+            , strictComp
             , # Warnings from `purs` to silence during compilation, independent of `strictComp`
               # Controls `--censor-codes` purescript-psa flag
-              censorCodes ? [ "UserDefinedWarning" ]
+              censorCodes
             , ...
             }:
             pkgs.stdenv.mkDerivation {
-              name = "ps-deps";
-              buildInputs = [
-              ];
+              inherit name;
               nativeBuildInputs = [
                 spagoPkgs.installSpagoStyle
                 easy-ps.psa
@@ -96,23 +93,22 @@
           # does not include any external files to its `output` (if we attempted to refer
           # to absolute paths from the project-wide `src` argument, they would be wrong)
           buildPursProject =
-            {
+            { projectName
               # If warnings generated from project source files will trigger a build error.
               # Controls `--strict` purescript-psa flag
-              strictComp ? true
+            , strictComp
             , # Warnings from `purs` to silence during compilation, independent of `strictComp`
               # Controls `--censor-codes` purescript-psa flag
-              censorCodes ? [ "UserDefinedWarning" ]
+              censorCodes
             , pursDependencies ? buildPursDependencies {
                 inherit strictComp censorCodes;
+                name = projectName + "-ps-deps";
               }
             , ...
             }:
             pkgs.stdenv.mkDerivation {
-              name = "ps-project";
+              name = projectName;
               src = ./.;
-              buildInputs = [
-              ];
               nativeBuildInputs = [
                 spagoPkgs.installSpagoStyle
                 easy-ps.psa
@@ -150,45 +146,10 @@
                 cp -r output $out/
               '';
             };
-
-          # Runs a test written in Purescript using NodeJS.
-          runPursTest =
-            {
-              # The main Purescript module
-              testMain
-            , # The entry point function in the main PureScript module
-              psEntryPoint ? "main"
-            , # Additional variables to pass to the test environment
-              env ? { }
-            , # Passed through to the `buildInputs` of the derivation. Use this to add
-              # additional packages to the test environment
-              buildInputs ? [ ]
-            , builtProject ? buildPursProject { main = testMain; }
-            , ...
-            }:
-            pkgs.runCommand "ps-test"
-              (
-                {
-                  src = ./.;
-                  buildInputs = [ pkgs.nodejs ];
-                }
-                // env
-              )
-              ''
-                # Copy the purescript project files
-                cp -r ${builtProject}/* .
-
-                # The tests may depend on sources
-                cp -r $src/* .
-
-                # Call the main module and execute the entry point function
-                node --enable-source-maps -e 'import("./output/${testMain}/index.js").then(m => m.${psEntryPoint}())'
-
-                # Create output file to tell Nix we succeeded
-                touch $out
-              '';
         in
         {
+          packages.default = buildPursProject { inherit projectName strictComp censorCodes; };
+
           devShells = {
             default = pkgs.mkShell {
               buildInputs = with pkgs; [
@@ -206,7 +167,6 @@
             };
           };
 
-          # Example flake checks. Run with `nix flake check --keep-going`
           checks = {
             formatting-check =
               pkgs.runCommand "formatting-check"
@@ -219,7 +179,7 @@
                 }
                 ''
                   cd ${self}
-                  purs-tidy check './src/**/*.purs' './test/**/*.purs'
+                  purs-tidy check './src/**/*.purs'
                   nixpkgs-fmt --check "$(fd --no-ignore-parent -enix --exclude='spago*')"
                   touch $out
                 '';
