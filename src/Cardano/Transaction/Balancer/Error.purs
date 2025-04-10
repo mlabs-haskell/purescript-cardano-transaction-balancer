@@ -27,7 +27,7 @@ module Cardano.Transaction.Balancer.Error
 import Prelude
 
 import Cardano.AsCbor (encodeCbor)
-import Cardano.Provider.TxEvaluation
+import Cardano.Provider
   ( RedeemerPointer
   , ScriptFailure
       ( ExtraRedeemers

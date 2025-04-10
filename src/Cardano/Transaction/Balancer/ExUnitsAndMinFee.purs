@@ -6,11 +6,12 @@ module Cardano.Transaction.Balancer.ExUnitsAndMinFee
 import Prelude
 
 import Cardano.AsCbor (encodeCbor)
-import Cardano.Kupmios.Ogmios.Types (AdditionalUtxoSet) as Ogmios
-import Cardano.Provider (Provider)
-import Cardano.Provider.TxEvaluation
-  ( TxEvaluationFailure(AdditionalUtxoOverlap, UnparsedError)
+import Cardano.Provider
+  ( OgmiosTxOut
+  , Provider
+  , TxEvaluationFailure(AdditionalUtxoOverlap, UnparsedError)
   , TxEvaluationResult(TxEvaluationResult)
+  , OgmiosTxOutRef
   )
 import Cardano.Transaction.Balancer.Error
   ( BalanceTxError(UtxoLookupFailedFor, ExUnitsEvaluationFailed, CouldNotComputeRefScriptsFee)
@@ -80,18 +81,18 @@ evalTxExecutionUnits
   -> BalanceTxM TxEvaluationResult
 evalTxExecutionUnits provider tx = worker <<< toOgmiosAdditionalUtxos
   where
-  toOgmiosAdditionalUtxos :: UtxoMap -> Ogmios.AdditionalUtxoSet
+  toOgmiosAdditionalUtxos :: UtxoMap -> Map OgmiosTxOutRef OgmiosTxOut
   toOgmiosAdditionalUtxos additionalUtxos =
-    wrap $ Map.fromFoldable
+    Map.fromFoldable
       ( bimap transactionInputToTxOutRef transactionOutputToOgmiosTxOut
           <$> (Map.toUnfoldable :: _ -> Array _) additionalUtxos
       )
 
-  worker :: Ogmios.AdditionalUtxoSet -> BalanceTxM TxEvaluationResult
+  worker :: Map OgmiosTxOutRef OgmiosTxOut -> BalanceTxM TxEvaluationResult
   worker additionalUtxos = do
     evalResult' <-
       map unwrap <$>
-        (liftAff $ attempt $ provider.evaluateTx tx (unwrap additionalUtxos))
+        (liftAff $ attempt $ provider.evaluateTx tx additionalUtxos)
     case evalResult' of
       Left err | tx ^. _isValid ->
         liftAff $ throwError err
@@ -102,8 +103,8 @@ evalTxExecutionUnits provider tx = worker <<< toOgmiosAdditionalUtxos
           Right a -> pure a
           Left (AdditionalUtxoOverlap overlappingUtxos) ->
             -- Remove overlapping additional utxos and retry evaluation:
-            worker $ wrap $ Map.filterKeys (flip Array.notElem overlappingUtxos)
-              (unwrap additionalUtxos)
+            worker $ Map.filterKeys (flip Array.notElem overlappingUtxos)
+              additionalUtxos
           Left evalFailure | tx ^. _isValid -> do
             throwError $ ExUnitsEvaluationFailed tx evalFailure
           Left _ -> do

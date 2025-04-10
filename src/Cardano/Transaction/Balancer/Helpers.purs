@@ -23,7 +23,7 @@ import Cardano.Data.Lite
   , packMapContainer
   , toBytes
   )
-import Cardano.Provider.TxEvaluation (OgmiosTxOut, OgmiosTxOutRef)
+import Cardano.Provider (OgmiosTxOut, OgmiosTxOutRef)
 import Cardano.Types (DataHash, TransactionInput(TransactionInput))
 import Cardano.Types.Address as Address
 import Cardano.Types.CostModel (CostModel)

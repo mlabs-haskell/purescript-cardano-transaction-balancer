@@ -6,7 +6,6 @@
   , "bifunctors"
   , "bytearrays"
   , "cardano-data-lite"
-  , "cardano-kupmios-provider"
   , "cardano-provider"
   , "cardano-transaction-builder"
   , "cardano-types"

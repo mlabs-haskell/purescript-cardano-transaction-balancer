@@ -171,19 +171,25 @@ let additions =
           , "aff-promise"
           , "affjax"
           , "argonaut-codecs"
+          , "arrays"
+          , "bifunctors"
           , "cardano-types"
-          , "console"
           , "effect"
           , "either"
+          , "exceptions"
+          , "foldable-traversable"
+          , "lists"
           , "maybe"
           , "newtype"
           , "ordered-collections"
           , "prelude"
           , "strings"
+          , "these"
+          , "tuples"
           , "uint"
           ]
         , repo = "https://github.com/mlabs-haskell/purescript-cardano-provider"
-        , version = "90e68dca60fbc14c6abfa9291a20b865f927338c"
+        , version = "v2.1.0"
         }
       , cardano-key-wallet =
         { dependencies =
@@ -293,54 +299,6 @@ let additions =
             "https://github.com/mlabs-haskell/purescript-cardano-transaction-builder"
         , version = "v3.0.0"
         }
-      , cardano-kupmios-provider =
-        { dependencies =
-          [ "aeson"
-          , "aff"
-          , "affjax"
-          , "arrays"
-          , "bifunctors"
-          , "bytearrays"
-          , "cardano-key-wallet"
-          , "cardano-provider"
-          , "cardano-data-lite"
-          , "cardano-types"
-          , "console"
-          , "control"
-          , "datetime"
-          , "effect"
-          , "either"
-          , "exceptions"
-          , "foldable-traversable"
-          , "foreign-object"
-          , "formatters"
-          , "http-methods"
-          , "integers"
-          , "js-bigints"
-          , "js-date"
-          , "lists"
-          , "maybe"
-          , "monad-logger"
-          , "newtype"
-          , "ordered-collections"
-          , "parallel"
-          , "partial"
-          , "prelude"
-          , "profunctor-lenses"
-          , "record"
-          , "strings"
-          , "stringutils"
-          , "tailrec"
-          , "these"
-          , "transformers"
-          , "tuples"
-          , "uint"
-          , "untagged-union"
-          ]
-        , repo =
-            "https://github.com/mlabs-haskell/purescript-cardano-kupmios-provider"
-        , version = "d08fc22de67ab9d24e9d20a3545228a5aaa5807f"
-        }
       }
 
-in  upstream // additions
+in (upstream // additions)
