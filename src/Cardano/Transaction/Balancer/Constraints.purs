@@ -3,7 +3,9 @@ module Cardano.Transaction.Balancer.Constraints
   , BalancerConstraints(BalancerConstraints)
   , buildBalancerConfig
   , BalancerConfig(BalancerConfig)
+  , UtxoPredicate
   , mustGenChangeOutsWithMaxTokenQuantity
+  , mustNotSpendUtxosWhere
   , mustNotSpendUtxosWithOutRefs
   , mustNotSpendUtxoWithOutRef
   , mustSendChangeToAddress
@@ -19,17 +21,16 @@ module Cardano.Transaction.Balancer.Constraints
   , _changeDatum
   , _maxChangeOutputTokenQuantity
   , _nonSpendableInputs
+  , _nonSpendableInputsPredicates
   , _selectionStrategy
   , _srcAddresses
   ) where
 
 import Prelude
 
-import Cardano.Types (Address, TransactionInput, UtxoMap)
+import Cardano.Transaction.Balancer.CoinSelection (SelectionStrategy(SelectionStrategyOptimal))
+import Cardano.Types (Address, TransactionInput, TransactionOutput, UtxoMap)
 import Cardano.Types.OutputDatum (OutputDatum)
-import Cardano.Transaction.Balancer.CoinSelection
-  ( SelectionStrategy(SelectionStrategyOptimal)
-  )
 import Data.Array (singleton) as Array
 import Data.Function (applyFlipped)
 import Data.Lens (Lens')
@@ -44,11 +45,14 @@ import Data.Set (singleton) as Set
 import JS.BigInt (BigInt)
 import Type.Proxy (Proxy(Proxy))
 
+type UtxoPredicate = TransactionInput -> TransactionOutput -> Boolean
+
 newtype BalancerConfig = BalancerConfig
   { additionalUtxos :: UtxoMap
   , collateralUtxos :: Maybe UtxoMap
   , maxChangeOutputTokenQuantity :: Maybe BigInt
   , nonSpendableInputs :: Set TransactionInput
+  , nonSpendableInputsPredicates :: Array UtxoPredicate
   , srcAddresses :: Maybe (Array Address)
   , changeAddress :: Maybe Address
   , changeDatum :: Maybe OutputDatum
@@ -69,6 +73,10 @@ _maxChangeOutputTokenQuantity =
 
 _nonSpendableInputs :: Lens' BalancerConfig (Set TransactionInput)
 _nonSpendableInputs = _Newtype <<< prop (Proxy :: Proxy "nonSpendableInputs")
+
+_nonSpendableInputsPredicates :: Lens' BalancerConfig (Array UtxoPredicate)
+_nonSpendableInputsPredicates =
+  _Newtype <<< prop (Proxy :: Proxy "nonSpendableInputsPredicates")
 
 _srcAddresses :: Lens' BalancerConfig (Maybe (Array Address))
 _srcAddresses = _Newtype <<< prop (Proxy :: Proxy "srcAddresses")
@@ -104,6 +112,7 @@ buildBalancerConfig = applyFlipped defaultConstraints <<< unwrap
     , collateralUtxos: Nothing
     , maxChangeOutputTokenQuantity: Nothing
     , nonSpendableInputs: mempty
+    , nonSpendableInputsPredicates: mempty
     , srcAddresses: Nothing
     , changeDatum: Nothing
     , changeAddress: Nothing
@@ -165,6 +174,17 @@ mustNotSpendUtxosWithOutRefs = wrap <<< appendOver _nonSpendableInputs
 -- | Tells the balancer not to spend a UTxO with the specified output reference.
 mustNotSpendUtxoWithOutRef :: TransactionInput -> BalancerConstraints
 mustNotSpendUtxoWithOutRef = mustNotSpendUtxosWithOutRefs <<< Set.singleton
+
+-- | Tells the balancer not to spend UTxO's based on the given predicate.
+-- | Note that `mustNotSpendUtxosWhere` constraints are stacked when specified
+-- | multiple times, and utxos are tested against each predicate. The order of
+-- | specifying multiple `mustNotSpendUtxosWhere` constraints does NOT affect
+-- | the resulting set.
+mustNotSpendUtxosWhere :: UtxoPredicate -> BalanceTxConstraintsBuilder
+mustNotSpendUtxosWhere =
+  wrap
+    <<< appendOver _nonSpendableInputsPredicates
+    <<< Array.singleton
 
 -- | Tells the balancer to use the provided UTxO set when evaluating script
 -- | execution units (sets `additionalUtxoSet` of Ogmios `EvaluateTx`).

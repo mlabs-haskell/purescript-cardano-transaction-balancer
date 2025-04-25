@@ -102,7 +102,7 @@ import Data.Array.NonEmpty
 import Data.Array.NonEmpty as NEA
 import Data.Bitraversable (ltraverse)
 import Data.Either (Either, hush, note)
-import Data.Foldable (fold, foldMap, foldr, length, null, sum)
+import Data.Foldable (any, fold, foldMap, foldr, length, null, or, sum)
 import Data.Lens.Getter (view, (^.))
 import Data.Lens.Setter ((%~), (.~), (?~))
 import Data.Log.Level (LogLevel(Info))
@@ -261,8 +261,12 @@ runBalancer unbalancedTx ctx = do
               hasScriptRef = isJust (unwrap output).scriptRef
 
               spendable :: Boolean
-              spendable = not $ Set.member oref nonSpendableInputs ||
-                Set.member oref referenceInputSet
+              spendable = not $ or
+                [ Set.member oref nonSpendableInputs
+                , Set.member oref referenceInputSet
+                , any (\f -> f oref output)
+                    (unwrap ctx.balancerConstraints).nonSpendableInputsPredicates
+                ]
 
               validInContext :: Boolean
               validInContext = not $ txHasPlutusV1 &&
