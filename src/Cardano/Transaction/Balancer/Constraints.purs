@@ -195,9 +195,15 @@ mustUseAdditionalUtxos = wrap <<< set _additionalUtxos
 
 -- | Tells the balancer to select from the provided UTxO set when choosing
 -- | collateral UTxOs, instead of UTxOs provided by the browser wallet.
--- | Note that UTxOs marked as non-spendable or used as reference (read-only)
--- | inputs will be excluded from collateral selection, even when specified
--- | via this constraint.
+-- |
+-- | Note that: 
+-- |
+-- | 1. Locked utxos, utxos marked as non-spendable, utxos used as reference
+-- | (read-only) inputs, or otherwise non-spendable utxos will be excluded from
+-- | collateral selection, even when specified via this constraint.
+-- |
+-- | 2. Any utxos specified by this constraint will not be considered during 
+-- | balancing to cover transaction outputs.
 mustUseCollateralUtxos :: UtxoMap -> BalancerConstraints
 mustUseCollateralUtxos = wrap <<< set _collateralUtxos <<< Just
 

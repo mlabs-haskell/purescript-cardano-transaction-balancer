@@ -113,15 +113,17 @@ import Data.Map
   , filter
   , insert
   , isEmpty
+  , keys
   , lookup
   , singleton
   , toUnfoldable
   , union
+  , unions
   ) as Map
 import Data.Maybe (Maybe(Just, Nothing), fromMaybe, isJust, maybe)
 import Data.Newtype (unwrap, wrap)
 import Data.Set (Set)
-import Data.Set (fromFoldable, member, toMap, toUnfoldable) as Set
+import Data.Set (empty, fromFoldable, member, toMap, toUnfoldable) as Set
 import Data.Traversable (for, traverse)
 import Data.Tuple (fst)
 import Data.Tuple.Nested (type (/\), (/\))
@@ -204,12 +206,16 @@ runBalancer unbalancedTx ctx = do
         spendableUtxos
   let txWithMinAda = addLovelacesToTransactionOutputs ctx.pparams txWithCollateral
   -- Get collateral inputs to mark them as unspendable.
-  -- Some CIP-30 wallets don't allow to sign Txs that spend it.
+  -- Some CIP-30 wallets don't allow to sign Txs that spend them.
   nonSpendableCollateralInputs <-
     liftAff
-      if ctx.walletInterface.isCip30Wallet then
-        ctx.walletInterface.getWalletCollateral <#>
-          fold >>> map (unwrap >>> _.input) >>> Set.fromFoldable
+      if ctx.walletInterface.isCip30Wallet then do
+        walletCollateral <-
+          ctx.walletInterface.getWalletCollateral <#>
+            fold >>> map (unwrap >>> _.input) >>> Set.fromFoldable
+        pure $
+          walletCollateral <>
+            maybe Set.empty Map.keys (unwrap ctx.balancerConstraints).collateralUtxos
       else mempty
   mainLoop allUtxos changeAddress $
     initBalancerState
@@ -233,7 +239,11 @@ runBalancer unbalancedTx ctx = do
         parTraverse (ctx.provider.utxosAt >>> liftAff >>> map hush) srcAddresses
           <#> traverse (note CouldNotGetUtxos)
             >>> map (foldr Map.union Map.empty) -- merge all utxos into one map
-    pure $ utxos `Map.union` ctx.extraUtxos
+    pure $ Map.unions
+      [ utxos
+      , ctx.extraUtxos
+      , fromMaybe Map.empty (unwrap ctx.balancerConstraints).collateralUtxos
+      ]
 
   coinSelectionStrategy :: SelectionStrategy
   coinSelectionStrategy = (unwrap ctx.balancerConstraints).selectionStrategy
