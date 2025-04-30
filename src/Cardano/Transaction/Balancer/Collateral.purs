@@ -4,12 +4,8 @@ module Cardano.Transaction.Balancer.Collateral
 
 import Prelude
 
-import Cardano.Transaction.Balancer.Collateral.Select (minRequiredCollateral, selectCollateral)
-import Cardano.Transaction.Balancer.Constraints
-  ( BalancerConfig
-  , _collateralUtxos
-  , _nonSpendableInputs
-  )
+import Cardano.Transaction.Balancer.Collateral.Select (minRequiredCollateral, selectCollateral) as Collateral
+import Cardano.Transaction.Balancer.Constraints (BalancerConfig)
 import Cardano.Transaction.Balancer.Error
   ( BalanceTxError
       ( CouldNotGetCollateral
@@ -21,6 +17,7 @@ import Cardano.Transaction.Balancer.Error
 import Cardano.Transaction.Balancer.Helpers (pprintTagSet)
 import Cardano.Transaction.Balancer.Types (BalanceTxM, logWithLevel)
 import Cardano.Transaction.Balancer.Types.ProtocolParameters (BalancerProtocolParameters)
+import Cardano.Transaction.Balancer.Types.Val (fromValue, getCoin) as Val
 import Cardano.Transaction.Balancer.UtxoMinAda (utxoMinAdaValue)
 import Cardano.Types
   ( Address
@@ -29,15 +26,18 @@ import Cardano.Types
   , MultiAsset
   , Transaction
   , TransactionOutput
-  , TransactionUnspentOutput
+  , TransactionUnspentOutput(TransactionUnspentOutput)
+  , UtxoMap
   , _body
   , _collateral
   , _collateralReturn
   , _totalCollateral
   )
-import Cardano.Types.BigNum (add, max, maxValue, sub, zero) as BigNum
+import Cardano.Types.Address (getPaymentCredential) as Address
+import Cardano.Types.BigNum (add, max, maxValue, sub, toBigInt, zero) as BigNum
+import Cardano.Types.Credential (asPubKeyHash) as Credential
 import Cardano.Types.MultiAsset as MultiAsset
-import Cardano.Types.TransactionUnspentOutput (toUtxoMap) as TransactionUnspentOutputs
+import Cardano.Types.TransactionUnspentOutput (fromUtxoMap, toUtxoMap)
 import Cardano.Types.UtxoMap (pprintUtxoMap)
 import Cardano.Types.Value (getMultiAsset, mkValue, valueToCoin) as Value
 import Control.Monad.Error.Class (liftEither, throwError)
@@ -45,13 +45,13 @@ import Control.Monad.Except (ExceptT(ExceptT))
 import Control.Monad.Except.Trans (except)
 import Data.Array (fromFoldable, null, partition) as Array
 import Data.Either (Either(Left, Right), note)
-import Data.Foldable (foldl)
-import Data.Lens ((^.), (.~))
+import Data.Foldable (foldMap, foldl)
+import Data.Lens ((.~))
 import Data.Lens.Setter ((?~))
 import Data.Log.Level (LogLevel(Warn))
-import Data.Maybe (Maybe(Just, Nothing))
+import Data.Map (filter, member) as Map
+import Data.Maybe (Maybe(Just, Nothing), isJust)
 import Data.Newtype (unwrap, wrap)
-import Data.Set (member) as Set
 import Data.UInt (toInt) as UInt
 import Effect.Aff (Aff)
 import Effect.Aff.Class (liftAff)
@@ -63,50 +63,89 @@ setTransactionCollateral
   -> Record (BalancerProtocolParameters r)
   -> Address
   -> Transaction
+  -> UtxoMap
   -> BalanceTxM Transaction
 setTransactionCollateral
   getWalletCollateralAff
   balancerConstraints
   pparams
   changeAddr
-  transaction = do
-  let
-    nonSpendableSet = balancerConstraints ^. _nonSpendableInputs
-    mbCollateralUtxos = balancerConstraints ^. _collateralUtxos
-  -- We must filter out UTxOs that are set as non-spendable in the balancer
-  -- constraints
-  let
-    isSpendable = not <<< flip Set.member nonSpendableSet
-    coinsPerUtxoByte = pparams.coinsPerUtxoByte
-  collateral <- case mbCollateralUtxos of
-    -- if no collateral utxos are specified, use the wallet, but filter
-    -- the unspendable ones
-    Nothing -> do
-      let isSpendableUtxo = isSpendable <<< _.input <<< unwrap
-      (walletCollateral :: Array TransactionUnspentOutput) <- ExceptT $ liftAff
-        $
-          note CouldNotGetCollateral <$>
+  transaction
+  spendableUtxos = do
+  collateral <-
+    case (unwrap balancerConstraints).collateralUtxos of
+      -- if no collateral utxos are specified, use the wallet, but filter
+      -- the unspendable ones
+      Nothing -> do
+        (walletCollateral :: Array TransactionUnspentOutput) <-
+          ExceptT $ liftAff $ note CouldNotGetCollateral <$>
             getWalletCollateralAff
-      let
-        { yes: spendableUtxos, no: filteredUtxos } = Array.partition
-          isSpendableUtxo
-          walletCollateral
-      when (not $ Array.null filteredUtxos) do
-        logWithLevel Warn $ pprintTagSet
-          "Some of the collateral UTxOs returned by the wallet were marked as non-spendable and ignored"
-          (pprintUtxoMap (TransactionUnspentOutputs.toUtxoMap filteredUtxos))
-      pure spendableUtxos
-    -- otherwise, get all the utxos, filter out unspendable, and select
-    -- collateral using internal algo, that is also used in KeyWallet
-    Just utxoMap -> do
-      let
-        maxCollateralInputs = UInt.toInt pparams.maxCollateralInputs
-        mbCollateral =
-          Array.fromFoldable <$>
-            selectCollateral coinsPerUtxoByte maxCollateralInputs utxoMap
-      liftEither $ note (InsufficientCollateralUtxos utxoMap) mbCollateral
+        let
+          { yes: spendableCollUtxos, no: filteredUtxos } = Array.partition
+            isSpendable
+            walletCollateral
+        when (not $ Array.null filteredUtxos) do
+          logWithLevel Warn $ pprintTagSet
+            "Some of the collateral UTxOs returned by the wallet were marked as non-spendable and ignored"
+            (pprintUtxoMap $ toUtxoMap filteredUtxos)
+        let
+          collVal =
+            foldMap (Val.fromValue <<< _.amount <<< unwrap <<< _.output <<< unwrap)
+              spendableCollUtxos
+          minRequiredCollateral = BigNum.toBigInt $ unwrap Collateral.minRequiredCollateral
+        if (Val.getCoin collVal < minRequiredCollateral) then do
+          logWithLevel Warn $ pprintTagSet
+            "Filtered collateral UTxOs do not cover the minimum required \
+            \collateral, reselecting collateral using the internal CTL algorithm"
+            (pprintUtxoMap $ toUtxoMap spendableCollUtxos)
+          selectCollateralFromUtxos pparams $ Map.filter isPkhUtxo spendableUtxos
+        else pure spendableCollUtxos
+      -- otherwise, select collateral from the spendable utxos using
+      -- the KeyWallet algorithm
+      Just utxoMap -> do
+        let
+          { yes: spendableCollUtxos, no: filteredUtxos } = Array.partition
+            isSpendable
+            (fromUtxoMap utxoMap)
+        when (not $ Array.null filteredUtxos) do
+          logWithLevel Warn $ pprintTagSet
+            "Some of the collateral UTxOs specified via the `mustUseCollateralUtxos` constraint \
+            \were marked as non-spendable and ignored"
+            (pprintUtxoMap $ toUtxoMap filteredUtxos)
+        selectCollateralFromUtxos pparams $ toUtxoMap spendableCollUtxos
   addTxCollateralReturn collateral (addTxCollateral collateral transaction) changeAddr
-    coinsPerUtxoByte
+    pparams.coinsPerUtxoByte
+  where
+  -- Utxos specified as reference (read-only) inputs or marked as unspendable in the balancer
+  -- constraints must be excluded from collateral selection.
+  isSpendable :: TransactionUnspentOutput -> Boolean
+  isSpendable (TransactionUnspentOutput { input, output }) =
+    Map.member input spendableUtxos
+      && isPkhUtxo output
+
+  isPkhUtxo :: TransactionOutput -> Boolean
+  isPkhUtxo txOut =
+    isJust do
+      cred <- Address.getPaymentCredential $ (unwrap txOut).address
+      Credential.asPubKeyHash $ unwrap cred
+
+-- | Select collateral from the provided utxos using the internal
+-- | collateral selection algorithm.
+selectCollateralFromUtxos
+  :: forall (r :: Row Type)
+   . Record (BalancerProtocolParameters r)
+  -> UtxoMap
+  -> BalanceTxM (Array TransactionUnspentOutput)
+selectCollateralFromUtxos pparams utxos = do
+  let
+    maxCollateralInputs = UInt.toInt $ pparams.maxCollateralInputs
+    mbCollateral =
+      Array.fromFoldable <$> Collateral.selectCollateral
+        pparams.coinsPerUtxoByte
+        maxCollateralInputs
+        utxos
+  liftEither $ note (InsufficientCollateralUtxos utxos)
+    mbCollateral
 
 addTxCollateral :: Array TransactionUnspentOutput -> Transaction -> Transaction
 addTxCollateral collateral transaction =
@@ -135,7 +174,7 @@ addTxCollateralReturn collateral transaction ownAddress coinsPerUtxoByte = do
   collMultiAsset <- throwOnOverflow $ MultiAsset.sum $ nonAdaAsset <$>
     collateral
   case
-    collAdaValue <= unwrap minRequiredCollateral && collMultiAsset ==
+    collAdaValue <= unwrap Collateral.minRequiredCollateral && collMultiAsset ==
       MultiAsset.empty
     of
     true ->
@@ -165,7 +204,7 @@ addTxCollateralReturn collateral transaction ownAddress coinsPerUtxoByte = do
       minAdaValue = utxoMinAdaValue coinsPerUtxoByte returnAsTxOut
     -- Determine the actual ada value of the collateral return output:
     collReturnAda <- throwOnOverflow do
-      remaining <- BigNum.sub collAdaValue (unwrap minRequiredCollateral)
+      remaining <- BigNum.sub collAdaValue (unwrap Collateral.minRequiredCollateral)
       pure $ BigNum.max remaining minAdaValue
     let
       -- Build the final collateral return output:

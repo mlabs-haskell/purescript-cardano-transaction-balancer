@@ -23,7 +23,6 @@ import Cardano.Transaction.Balancer.Constraints
   , _changeDatum
   , _collateralUtxos
   , _maxChangeOutputTokenQuantity
-  , _nonSpendableInputs
   )
 import Cardano.Transaction.Balancer.Error
   ( BalanceTxError(CouldNotGetUtxos, NumericOverflowError, UtxoLookupFailedFor)
@@ -108,11 +107,23 @@ import Data.Lens.Setter ((%~), (.~), (?~))
 import Data.Log.Level (LogLevel(Info))
 import Data.Log.Tag (TagSet, tag, tagSetTag)
 import Data.Log.Tag (fromArray) as TagSet
-import Data.Map (empty, filter, insert, isEmpty, lookup, singleton, toUnfoldable, union) as Map
+import Data.Map
+  ( difference
+  , empty
+  , filter
+  , insert
+  , isEmpty
+  , keys
+  , lookup
+  , singleton
+  , toUnfoldable
+  , union
+  , unions
+  ) as Map
 import Data.Maybe (Maybe(Just, Nothing), fromMaybe, isJust, maybe)
 import Data.Newtype (unwrap, wrap)
 import Data.Set (Set)
-import Data.Set (fromFoldable, member, toUnfoldable) as Set
+import Data.Set (empty, fromFoldable, member, toMap, toUnfoldable) as Set
 import Data.Traversable (for, traverse)
 import Data.Tuple (fst)
 import Data.Tuple.Nested (type (/\), (/\))
@@ -180,6 +191,9 @@ runBalancer unbalancedTx ctx = do
     maybe (liftAff ctx.walletInterface.getChangeAddress) pure
       (unwrap ctx.balancerConstraints).changeAddress
   let txWithNetwork = setTxNetwork ctx.network unbalancedTx
+  allUtxos <- getAllUtxos
+  availableUtxos <- liftAff $ ctx.walletInterface.filterLockedUtxos allUtxos
+  let spendableUtxos = getSpendableUtxos availableUtxos
   txWithCollateral <-
     case (unwrap (unwrap txWithNetwork).witnessSet).redeemers of
       -- Don't set collateral if tx doesn't contain phase-2 scripts:
@@ -189,18 +203,24 @@ runBalancer unbalancedTx ctx = do
         ctx.pparams
         changeAddress
         txWithNetwork
+        spendableUtxos
+  let txWithMinAda = addLovelacesToTransactionOutputs ctx.pparams txWithCollateral
+  -- Get collateral inputs to mark them as unspendable.
+  -- Some CIP-30 wallets don't allow to sign Txs that spend them.
   nonSpendableCollateralInputs <-
     liftAff
-      if ctx.walletInterface.isCip30Wallet then
-        ctx.walletInterface.getWalletCollateral <#>
-          fold >>> map (unwrap >>> _.input) >>> Set.fromFoldable
+      if ctx.walletInterface.isCip30Wallet then do
+        walletCollateral <-
+          ctx.walletInterface.getWalletCollateral <#>
+            fold >>> map (unwrap >>> _.input) >>> Set.fromFoldable
+        pure $
+          walletCollateral <>
+            maybe Set.empty Map.keys (unwrap ctx.balancerConstraints).collateralUtxos
       else mempty
-  allUtxos <- getAllUtxos
-  availableUtxos <- liftAff $ ctx.walletInterface.filterLockedUtxos allUtxos
-  let
-    txWithMinAda = addLovelacesToTransactionOutputs ctx.pparams txWithCollateral
-    spendableUtxos = getSpendableUtxos availableUtxos nonSpendableCollateralInputs
-  mainLoop allUtxos changeAddress $ initBalancerState spendableUtxos txWithMinAda
+  mainLoop allUtxos changeAddress $
+    initBalancerState
+      (Map.difference spendableUtxos $ Set.toMap nonSpendableCollateralInputs)
+      txWithMinAda
   where
   getAllUtxos :: BalanceTxM UtxoMap
   getAllUtxos = do
@@ -219,7 +239,11 @@ runBalancer unbalancedTx ctx = do
         parTraverse (ctx.provider.utxosAt >>> liftAff >>> map hush) srcAddresses
           <#> traverse (note CouldNotGetUtxos)
             >>> map (foldr Map.union Map.empty) -- merge all utxos into one map
-    pure $ utxos `Map.union` ctx.extraUtxos
+    pure $ Map.unions
+      [ utxos
+      , ctx.extraUtxos
+      , fromMaybe Map.empty (unwrap ctx.balancerConstraints).collateralUtxos
+      ]
 
   coinSelectionStrategy :: SelectionStrategy
   coinSelectionStrategy = (unwrap ctx.balancerConstraints).selectionStrategy
@@ -240,14 +264,10 @@ runBalancer unbalancedTx ctx = do
         PlutusScript (_ /\ PlutusV1) -> true
         _ -> false
 
-  getSpendableUtxos :: UtxoMap -> Set TransactionInput -> UtxoMap
-  getSpendableUtxos availableUtxos nonSpendableCollateralInputs =
-    -- Get collateral inputs to mark them as unspendable.
-    -- Some CIP-30 wallets don't allow to sign Txs that spend it.
+  getSpendableUtxos :: UtxoMap -> UtxoMap
+  getSpendableUtxos availableUtxos =
     let
-      nonSpendableInputs =
-        (ctx.balancerConstraints ^. _nonSpendableInputs)
-          <> nonSpendableCollateralInputs
+      nonSpendableInputs = (unwrap ctx.balancerConstraints).nonSpendableInputs
     in
       _.spendable $ foldr
         ( \(oref /\ output) acc ->
