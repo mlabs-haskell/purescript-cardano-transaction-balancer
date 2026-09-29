@@ -56,7 +56,7 @@ import Cardano.Types
       , StakeRegistration
       )
   , Coin(Coin)
-  , Language(PlutusV1)
+  , Language(PlutusV1, PlutusV3)
   , NetworkId
   , PlutusScript(PlutusScript)
   , Transaction
@@ -78,6 +78,7 @@ import Cardano.Types
 import Cardano.Types.BigNum as BigNum
 import Cardano.Types.Coin as Coin
 import Cardano.Types.OutputDatum (OutputDatum(OutputDatum))
+import Cardano.Types.ScriptRef (ScriptRef(PlutusScriptRef))
 import Cardano.Types.TransactionBody (_votingProposals)
 import Cardano.Types.TransactionInput (TransactionInput)
 import Cardano.Types.Value (getMultiAsset, mkValue, pprintValue)
@@ -193,7 +194,7 @@ runBalancer unbalancedTx ctx = do
   let txWithNetwork = setTxNetwork ctx.network unbalancedTx
   allUtxos <- getAllUtxos
   availableUtxos <- liftAff $ ctx.walletInterface.filterLockedUtxos allUtxos
-  let spendableUtxos = getSpendableUtxos availableUtxos
+  let spendableUtxos = getSpendableUtxos allUtxos availableUtxos
   txWithCollateral <-
     case (unwrap (unwrap txWithNetwork).witnessSet).redeemers of
       -- Don't set collateral if tx doesn't contain phase-2 scripts:
@@ -254,20 +255,36 @@ runBalancer unbalancedTx ctx = do
   miscFee :: BigInt
   miscFee = getCertsBalance unbalancedTx ctx.pparams + getProposalsBalance unbalancedTx
 
-  -- We check if the transaction uses a plutusv1 script, so that we can filter
-  -- out utxos which use plutusv2 features if so.
-  txHasPlutusV1 :: Boolean
-  txHasPlutusV1 =
-    case (unwrap (unwrap unbalancedTx).witnessSet).plutusScripts of
-      [] -> false
-      scripts -> flip Array.any scripts case _ of
-        PlutusScript (_ /\ PlutusV1) -> true
-        _ -> false
+  -- Detect whether the tx executes a script of a given Plutus version. We
+  -- scan both the witness set and the reference scripts attached to
+  -- reference-input UTxOs. Reference-input UTxOs that can't be resolved from
+  -- `allUtxos` are skipped - we can only inspect what the caller has supplied.
+  -- This is a heuristic based on scripts *available* to the tx, not scripts
+  -- *required* by script credentials.
+  txHasPlutus :: Language -> UtxoMap -> Boolean
+  txHasPlutus lang allUtxos =
+    Array.any isLang witnessScripts
+      || Array.any isLang referenceScripts
+    where
+    isLang (PlutusScript (_ /\ l)) = l == lang
+    witnessScripts =
+      (unwrap (unwrap unbalancedTx).witnessSet).plutusScripts
+    referenceInputs =
+      (unwrap (unwrap unbalancedTx).body).referenceInputs
+    referenceScripts = Array.mapMaybe resolveRefScript referenceInputs
+    resolveRefScript oref = do
+      output <- Map.lookup oref allUtxos
+      ref <- (unwrap output).scriptRef
+      case ref of
+        PlutusScriptRef ps -> Just ps
+        _ -> Nothing
 
-  getSpendableUtxos :: UtxoMap -> UtxoMap
-  getSpendableUtxos availableUtxos =
+  getSpendableUtxos :: UtxoMap -> UtxoMap -> UtxoMap
+  getSpendableUtxos allUtxos availableUtxos =
     let
       nonSpendableInputs = (unwrap ctx.balancerConstraints).nonSpendableInputs
+      txHasPlutusV1 = txHasPlutus PlutusV1 allUtxos
+      txHasPlutusV3 = txHasPlutus PlutusV3 allUtxos
     in
       _.spendable $ foldr
         ( \(oref /\ output) acc ->
@@ -283,7 +300,7 @@ runBalancer unbalancedTx ctx = do
               spendable :: Boolean
               spendable = not $ or
                 [ Set.member oref nonSpendableInputs
-                , Set.member oref referenceInputSet
+                , Set.member oref referenceInputSet && txHasPlutusV3
                 , any (\f -> f oref output)
                     (unwrap ctx.balancerConstraints).nonSpendableInputsPredicates
                 ]
