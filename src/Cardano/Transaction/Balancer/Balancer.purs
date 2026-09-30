@@ -255,12 +255,13 @@ runBalancer unbalancedTx ctx = do
   miscFee :: BigInt
   miscFee = getCertsBalance unbalancedTx ctx.pparams + getProposalsBalance unbalancedTx
 
-  -- Detect whether the tx executes a script of a given Plutus version. We
-  -- scan both the witness set and the reference scripts attached to
-  -- reference-input UTxOs. Reference-input UTxOs that can't be resolved from
-  -- `allUtxos` are skipped - we can only inspect what the caller has supplied.
-  -- This is a heuristic based on scripts *available* to the tx, not scripts
-  -- *required* by script credentials.
+  -- Detect a Plutus language by scanning scripts *available* to the tx.
+  -- Always includes the witness set. For V2/V3 also includes reference
+  -- scripts attached to any input (spending or reference). For V1 only
+  -- reference-input scripts count - a V1 script on a spending input's
+  -- `scriptRef` cannot be invoked, since V1 execution fails in the
+  -- presence of reference scripts on spent inputs. Unresolved UTxOs are
+  -- skipped.
   txHasPlutus :: Language -> UtxoMap -> Boolean
   txHasPlutus lang allUtxos =
     Array.any isLang witnessScripts
@@ -269,9 +270,11 @@ runBalancer unbalancedTx ctx = do
     isLang (PlutusScript (_ /\ l)) = l == lang
     witnessScripts =
       (unwrap (unwrap unbalancedTx).witnessSet).plutusScripts
-    referenceInputs =
-      (unwrap (unwrap unbalancedTx).body).referenceInputs
-    referenceScripts = Array.mapMaybe resolveRefScript referenceInputs
+    body = unwrap (unwrap unbalancedTx).body
+    scannedInputs = case lang of
+      PlutusV1 -> body.referenceInputs
+      _ -> body.referenceInputs <> body.inputs
+    referenceScripts = Array.mapMaybe resolveRefScript scannedInputs
     resolveRefScript oref = do
       output <- Map.lookup oref allUtxos
       ref <- (unwrap output).scriptRef
