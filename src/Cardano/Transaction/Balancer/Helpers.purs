@@ -169,16 +169,13 @@ setScriptDataHash
   -> Array PlutusData
   -> Transaction
   -> Effect Transaction
-setScriptDataHash costModels rs ds tx@(Transaction { body, witnessSet })
-  -- No hash should be set if *all* of the following hold:
-  --
-  --   * there are no scripts
-  --   * there are no redeemers
-  --   * there are no datums
-  --
-  | null (unwrap witnessSet).plutusScripts
-  , null (unwrap witnessSet).plutusData
-  , null rs
+setScriptDataHash costModels rs ds tx@(Transaction { body })
+  -- Mirrors `mkScriptIntegrity` in cardano-ledger: the integrity hash is
+  -- absent iff redeemers, used-languages, and datums are all empty. `null rs`
+  -- already implies `null langs` (no redeemers means no scripts execute,
+  -- hence no languages used), so we skip that check.
+  -- https://github.com/IntersectMBO/cardano-ledger/blob/834b0998f94247ffad57379850d56f3ad2c914d7/eras/alonzo/impl/src/Cardano/Ledger/Alonzo/Tx.hs#L453-L472
+  | null rs
   , null ds = pure tx
   | otherwise = do
       let

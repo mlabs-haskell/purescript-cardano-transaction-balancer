@@ -187,6 +187,12 @@ finalizeTransaction tx utxos pparams = do
   refPlutusScripts <- except $ getRefPlutusScripts txBody
 
   let
+    -- FIXME: this over-counts. Only scripts actually required by a script
+    -- credential (spending / minting / cert / withdrawal / vote / proposal)
+    -- should contribute to the language set. Unused scripts in the witness
+    -- set or on reference-input UTxOs must not pull their cost model into
+    -- the integrity hash - the ledger will reject the tx if the hash
+    -- covers cost models it did not use.
     scripts :: Array PlutusScript
     scripts = (_.plutusScripts $ unwrap ws) <> refPlutusScripts
 
