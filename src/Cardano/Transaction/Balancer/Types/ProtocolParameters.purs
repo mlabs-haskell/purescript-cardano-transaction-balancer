@@ -12,6 +12,7 @@ type BalancerProtocolParameters (r :: Row Type) =
   ( txFeeFixed :: Coin
   , txFeePerByte :: UInt
   , stakeAddressDeposit :: Coin
+  , stakePoolDeposit :: Coin
   , coinsPerUtxoByte :: Coin
   , costModels :: Map Language CostModel
   , prices :: ExUnitPrices
