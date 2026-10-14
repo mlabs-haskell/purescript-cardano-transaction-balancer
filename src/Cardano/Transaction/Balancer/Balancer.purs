@@ -54,6 +54,7 @@ import Cardano.Types
       , StakeRegDelegCert
       , StakeDeregistration
       , StakeRegistration
+      , PoolRegistration
       )
   , Coin(Coin)
   , Language(PlutusV1, PlutusV3)
@@ -808,6 +809,9 @@ getCertsBalance tx pparams =
     stakeAddressDeposit :: BigInt
     stakeAddressDeposit = BigNum.toBigInt $ unwrap pparams.stakeAddressDeposit
 
+    stakePoolDeposit :: BigInt
+    stakePoolDeposit = BigNum.toBigInt $ unwrap pparams.stakePoolDeposit
+
     toBi :: Coin -> BigInt
     toBi = BigNum.toBigInt <<< unwrap
 
@@ -836,6 +840,12 @@ getCertsBalance tx pparams =
 
               UnregDrepCert _ drepDeposit ->
                 negate $ toBi drepDeposit
+
+              -- PoolRetirement intentionally omitted: pool-retirement
+              -- deposits are returned to the reward account at the
+              -- retirement epoch, not in the retirement transaction.
+              PoolRegistration _ ->
+                stakePoolDeposit
 
               _ -> zero
           )

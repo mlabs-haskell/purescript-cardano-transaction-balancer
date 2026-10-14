@@ -29,6 +29,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) 
   preventing spurious `PPViewHashesDontMatch` / `ScriptIntegrityHashMismatch`
   failures. ([#5](https://github.com/mlabs-haskell/purescript-cardano-transaction-balancer/pull/5))
 
+- `getCertsBalance` now accounts for the stake pool deposit on
+  `PoolRegistration` certificates, so pool-registration transactions select
+  enough inputs to cover `stakePoolDeposit`. Previously the deposit was
+  silently ignored and the ledger rejected the submitted transaction with a
+  value-not-conserved error. `PoolRetirement` is intentionally not credited,
+  since the refund is deferred to the retirement epoch rather than returned
+  in the retirement transaction. `BalancerProtocolParameters` gains a
+  required `stakePoolDeposit :: Coin` field. ([#7](https://github.com/mlabs-haskell/purescript-cardano-transaction-balancer/pull/7)) 
+
 # [v1.1.0]
 
 ## Added
